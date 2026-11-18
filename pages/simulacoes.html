@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Simulador de entrevistas — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/simulacoes-data.js"></script>
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<div id="list-view">
+<span class="kicker">Prática</span>
+<h1>Simulador de entrevistas</h1>
+<p class="lead">25 problemas no formato real: 45 minutos, enunciado vago, entrevistador que responde às suas perguntas, deep dives e perguntas-surpresa. No fim, uma rubrica para você se avaliar.</p>
+
+<h2 id="como">Como usar</h2>
+<ol>
+<li><strong>Escolha um problema</strong> e inicie o cronômetro. Tente <em>não</em> ler o capítulo antes.</li>
+<li><strong>Escreva em voz alta</strong> (ou nos campos de texto) as perguntas que faria. Depois revele as respostas do entrevistador.</li>
+<li>Em cada fase, <strong>escreva sua resposta antes</strong> de revelar a resposta-modelo. As notas ficam salvas no seu navegador.</li>
+<li>No deep dive, responda cada pergunta antes de abrir.</li>
+<li>Peça as <strong>perguntas-surpresa</strong> uma a uma, como o entrevistador faria.</li>
+<li>Marque a <strong>rubrica</strong> com honestidade. Refaça o mesmo problema uma semana depois.</li>
+</ol>
+<div class="box tip"><strong class="t">Treinando com outra pessoa</strong>Peça que ela abra a simulação no modo entrevistador (botão "Mostrar tudo"). Ela responde às suas perguntas com o que está em "respostas do entrevistador" e faz as perguntas de deep dive e as surpresas.</div>
+
+<h2 id="problemas">Problemas</h2>
+<div class="filters" id="sim-filters">
+  <button data-f="all" class="on">Todos</button>
+  <button data-f="livro">Do livro</button>
+  <button data-f="extra">Extras (frequentes em big techs)</button>
+  <button data-f="easy">Fácil</button>
+  <button data-f="medium">Médio</button>
+  <button data-f="hard">Difícil</button>
+</div>
+<div class="grid" id="sim-list"></div>
+</div>
+
+<div id="sim-view" hidden></div>
+
+</article>
+</main>
+
+<script>
+(function () {
+  const LEVEL = { easy: "fácil", medium: "médio", hard: "difícil" };
+  const listEl = document.getElementById("sim-list");
+  const listView = document.getElementById("list-view");
+  const simView = document.getElementById("sim-view");
+  const store = {
+    get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
+    set(k, v) { localStorage.setItem(k, JSON.stringify(v)); },
+  };
+  const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  function renderList(filter = "all") {
+    const scores = store.get("sdprep:sims", {});
+    listEl.innerHTML = SIMULATIONS.filter((s) =>
+      filter === "all" || s.source === filter || s.level === filter
+    ).map((s) => {
+      const sc = scores[s.id];
+      return `<a class="card" href="#${s.id}">
+        <span class="num">${s.source === "livro" ? "DO LIVRO" : "EXTRA"}</span>
+        <h4>${s.title}</h4><p>${s.prompt}</p>
+        <span class="tag ${s.level}">${LEVEL[s.level]}</span>
+        ${sc != null ? `<span class="tag">última nota: ${sc}%</span>` : ""}
+      </a>`;
+    }).join("");
+  }
+  document.getElementById("sim-filters").addEventListener("click", (e) => {
+    if (e.target.tagName !== "BUTTON") return;
+    document.querySelectorAll("#sim-filters button").forEach((b) => b.classList.toggle("on", b === e.target));
+    renderList(e.target.dataset.f);
+  });
+
+  // ---------- simulação ----------
+  let timer = null, remaining = 45 * 60, running = false;
+  function fmt(s) { return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`; }
+  function tick() {
+    remaining = Math.max(0, remaining - 1);
+    const t = document.getElementById("timer");
+    if (t) { t.textContent = fmt(remaining); t.classList.toggle("low", remaining < 5 * 60); }
+    if (remaining === 0) stopTimer();
+  }
+  function stopTimer() { clearInterval(timer); timer = null; running = false; }
+
+  const PHASES = [
+    { key: "req", title: "1. Requisitos", min: 5, ask: "Liste os requisitos funcionais e não funcionais, com base nas respostas do entrevistador." },
+    { key: "est", title: "2. Estimativas", min: 3, ask: "Calcule QPS, armazenamento e o que mais importar. Que decisão os números implicam?" },
+    { key: "api", title: "3. API e modelo de dados", min: 5, ask: "Defina os endpoints e as entidades principais. Qual banco e por quê?" },
+    { key: "hld", title: "4. Design de alto nível", min: 10, ask: "Desenhe os componentes (papel, Excalidraw ou texto) e percorra os fluxos principais." },
+  ];
+
+  function lazyMermaid(scope) {
+    const pending = scope.querySelectorAll("pre.mermaid-lazy");
+    if (!pending.length) return;
+    pending.forEach((p) => { p.classList.remove("mermaid-lazy"); p.classList.add("mermaid"); });
+    window.SD && SD.renderMermaid(false, scope);
+  }
+
+  function noteBox(simId, key) {
+    const k = `sdprep:notes:${simId}:${key}`;
+    const v = localStorage.getItem(k) || "";
+    return `<textarea data-note="${k}" placeholder="Sua resposta… (salva automaticamente)">${esc(v)}</textarea>`;
+  }
+
+  function renderSim(s) {
+    remaining = 45 * 60; stopTimer();
+    const phases = PHASES.map((p) => `
+      <section class="phase">
+        <header><h3>${p.title}</h3><span class="tag">~${p.min} min</span></header>
+        <div class="inner">
+          <p>${p.ask}</p>
+          ${noteBox(s.id, p.key)}
+          <p><button class="btn small ghost" data-reveal="r-${p.key}">Revelar resposta-modelo</button></p>
+          <div class="reveal box info" id="r-${p.key}">${s[p.key]}
+            ${p.key === "hld" && s.diagram ? `<figure class="mermaid-wrap"><pre class="mermaid-lazy">${s.diagram}</pre></figure>` : ""}
+          </div>
+        </div>
+      </section>`).join("");
+
+    const deep = s.deep.map(([q, a], i) => `
+      <details><summary>${q}</summary><div class="body">${noteBox(s.id, "deep" + i)}<p><button class="btn small ghost" data-reveal="d-${i}">Revelar resposta</button></p><div class="reveal box info" id="d-${i}">${a}</div></div></details>`).join("");
+
+    const curve = s.curve.map(([q, a], i) => `
+      <div class="reveal box interview curve" id="c-${i}"><strong class="t">Entrevistador: "${q}"</strong>
+        ${noteBox(s.id, "curve" + i)}
+        <details><summary>Ver resposta sugerida</summary><div class="body">${a}</div></details></div>`).join("");
+
+    const rubric = [...(s.rubric || []), ...COMMON_RUBRIC];
+    const saved = store.get(`sdprep:rubric:${s.id}`, {});
+
+    simView.innerHTML = `
+      <p><a href="#">← Todos os problemas</a></p>
+      <span class="kicker">${s.source === "livro" ? "Do livro" : "Extra"} · ${LEVEL[s.level]}</span>
+      <h1>${s.title}</h1>
+      <div class="sim-head">
+        <span class="timer" id="timer">${fmt(remaining)}</span>
+        <button class="btn small" id="t-start">Iniciar</button>
+        <button class="btn small ghost" id="t-reset">Zerar</button>
+        <span style="flex:1"></span>
+        <button class="btn small ghost" id="show-all">Mostrar tudo (modo entrevistador)</button>
+      </div>
+      <div class="box interview"><strong class="t">Entrevistador:</strong> "${s.prompt}"</div>
+
+      <h2>0. Perguntas de clarificação (~3 min)</h2>
+      <p>Que perguntas você faria? Escreva antes de revelar.</p>
+      ${noteBox(s.id, "clarify")}
+      <p><button class="btn small ghost" data-reveal="r-clarify">Revelar respostas do entrevistador</button></p>
+      <div class="reveal" id="r-clarify"><div class="dialog">${s.clarify.map(([q, a]) => `<p class="c">${q}</p><p class="i">${a}</p>`).join("")}</div></div>
+
+      ${phases}
+
+      <h2>5. Deep dive (~15 min)</h2>
+      <p>O entrevistador vai explorar estes pontos. Responda cada um antes de abrir a resposta.</p>
+      ${deep}
+
+      <h2>6. Perguntas-surpresa</h2>
+      <p>Clique para receber a próxima pergunta, como numa entrevista real.</p>
+      <p><button class="btn small" id="next-curve">Próxima pergunta-surpresa (${s.curve.length})</button></p>
+      ${curve}
+
+      <h2>7. Autoavaliação</h2>
+      <div class="rubric card">
+        ${rubric.map((r, i) => `<label><input type="checkbox" data-r="${i}" ${saved[i] ? "checked" : ""}> ${r}</label>`).join("")}
+        <p class="score" id="score"></p>
+        <button class="btn small" id="save-score">Salvar resultado</button>
+      </div>
+      ${s.chapter ? `<p style="margin-top:20px">📖 Estudo completo: <a href="${s.chapter}">${s.title}</a></p>` : ""}`;
+
+    listView.hidden = true; simView.hidden = false; scrollTo(0, 0);
+
+    simView.querySelectorAll("textarea[data-note]").forEach((t) =>
+      t.addEventListener("input", () => localStorage.setItem(t.dataset.note, t.value)));
+    simView.querySelectorAll("[data-reveal]").forEach((b) => b.addEventListener("click", () => {
+      const el = document.getElementById(b.dataset.reveal);
+      el.classList.toggle("show");
+      lazyMermaid(el);
+    }));
+    document.getElementById("t-start").onclick = (e) => {
+      if (running) { stopTimer(); e.target.textContent = "Continuar"; }
+      else { timer = setInterval(tick, 1000); running = true; e.target.textContent = "Pausar"; }
+    };
+    document.getElementById("t-reset").onclick = () => { stopTimer(); remaining = 45 * 60; document.getElementById("timer").textContent = fmt(remaining); document.getElementById("t-start").textContent = "Iniciar"; };
+    let ci = 0;
+    const nc = document.getElementById("next-curve");
+    nc.onclick = () => {
+      const el = document.getElementById("c-" + ci);
+      if (el) { el.classList.add("show"); ci++; }
+      nc.textContent = ci < s.curve.length ? `Próxima pergunta-surpresa (${s.curve.length - ci})` : "Sem mais perguntas";
+    };
+    document.getElementById("show-all").onclick = () => {
+      simView.querySelectorAll(".reveal").forEach((r) => r.classList.add("show"));
+      simView.querySelectorAll("details").forEach((d) => (d.open = true));
+      lazyMermaid(simView);
+    };
+    const boxes = [...simView.querySelectorAll("input[data-r]")];
+    const calc = () => {
+      const pct = Math.round((boxes.filter((b) => b.checked).length / boxes.length) * 100);
+      const msg = pct >= 85 ? "Forte: nível de contratação sênior." : pct >= 65 ? "Bom: revise os itens desmarcados." : "Em construção: estude o capítulo e refaça.";
+      document.getElementById("score").textContent = `${pct}% — ${msg}`;
+      return pct;
+    };
+    boxes.forEach((b) => b.addEventListener("change", () => {
+      const st = {}; boxes.forEach((x) => { if (x.checked) st[x.dataset.r] = true; });
+      store.set(`sdprep:rubric:${s.id}`, st); calc();
+    }));
+    calc();
+    document.getElementById("save-score").onclick = (e) => {
+      const all = store.get("sdprep:sims", {}); all[s.id] = calc(); store.set("sdprep:sims", all);
+      e.target.textContent = "Salvo ✓";
+    };
+  }
+
+  function route() {
+    const id = location.hash.slice(1);
+    const s = SIMULATIONS.find((x) => x.id === id);
+    if (s) renderSim(s);
+    else { stopTimer(); simView.hidden = true; listView.hidden = false; renderList(); }
+  }
+  addEventListener("hashchange", route);
+  route();
+})();
+</script>
+</body>
+</html>

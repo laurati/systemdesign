@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Sistema de chat — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Capítulo 12 · Estudo de caso</span>
+<h1>Projete um sistema de chat</h1>
+<p class="lead">WhatsApp, Messenger, Slack, Discord. Conexões persistentes com milhões de usuários, mensagens em ordem, sincronização entre dispositivos e o indicador "online".</p>
+
+<div class="objectives"><h4>Ao final você saberá:</h4><ul>
+<li>Comparar polling, long polling e WebSocket.</li>
+<li>Separar serviços stateless, stateful (chat) e de terceiros (push).</li>
+<li>Escolher o armazenamento de mensagens e o esquema de IDs.</li>
+<li>Rotear mensagens 1:1 e de grupo, sincronizar dispositivos e implementar presença.</li>
+</ul></div>
+
+<h2 id="requisitos">Requisitos</h2>
+<div class="dialog">
+<p class="c">1:1 ou grupo?</p><p class="i">Os dois.</p>
+<p class="c">Mobile, web?</p><p class="i">Os dois.</p>
+<p class="c">Escala?</p><p class="i">50 milhões de DAU.</p>
+<p class="c">Tamanho de grupo?</p><p class="i">Até 100 pessoas.</p>
+<p class="c">Funcionalidades?</p><p class="i">Chat 1:1 e em grupo, indicador online, só texto.</p>
+<p class="c">Tamanho da mensagem?</p><p class="i">Até 100 mil caracteres.</p>
+<p class="c">Criptografia ponta a ponta?</p><p class="i">Não por agora.</p>
+<p class="c">Por quanto tempo guardar o histórico?</p><p class="i">Para sempre.</p>
+</div>
+<p>Também: multi-dispositivo (uma conta logada em vários aparelhos) e push notifications.</p>
+
+<h2 id="protocolo">Como o servidor envia mensagens ao cliente?</h2>
+<p>O remetente envia via HTTP sem problema. O desafio é o <strong>servidor iniciar</strong> o envio ao destinatário.</p>
+<div class="table-wrap"><table>
+<tr><th>Técnica</th><th>Como</th><th>Problema</th></tr>
+<tr><td>Polling</td><td>Cliente pergunta "tem novidade?" periodicamente</td><td>A maioria das respostas é vazia: desperdício</td></tr>
+<tr><td>Long polling</td><td>Cliente segura a conexão até haver mensagem ou timeout</td><td>O servidor que recebeu a mensagem pode não ser o que segura a conexão; não sabe bem se o cliente desconectou; ainda ineficiente para usuários pouco ativos</td></tr>
+<tr><td><strong>WebSocket</strong></td><td>Conexão bidirecional persistente, iniciada como HTTP (upgrade)</td><td>Conexões stateful: exige gestão eficiente no servidor</td></tr>
+</table></div>
+<p>Escolha: <strong>WebSocket</strong> para enviar e receber. Funciona nas portas 80/443, então passa por firewalls.</p>
+
+<h2 id="alto-nivel">Design de alto nível</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  U[Clientes] -->|HTTP: login, perfil, grupos| LB[LB] --> API[Serviços stateless]
+  API --> SD[Service discovery: Zookeeper]
+  SD -.->|"melhor chat server para o cliente"| U
+  U <-->|WebSocket| CS1[Chat server 1]
+  U <-->|WebSocket| CS2[Chat server 2]
+  CS1 & CS2 --> IDG[ID generator]
+  CS1 & CS2 --> MQ[[Sync queues / message bus]]
+  MQ --> CS1 & CS2
+  CS1 & CS2 --> KV[(KV store: mensagens)]
+  CS1 & CS2 --> PRES[Presence servers]
+  MQ --> PN[Push notification: destinatário offline]
+  API --> DB[(SQL: usuários, grupos, settings)]</pre></figure>
+<ul>
+<li><strong>Serviços stateless:</strong> login, cadastro, perfil, grupos, atrás de LB. Inclui o <strong>service discovery</strong>, que indica a qual chat server o cliente deve conectar (por geografia e carga).</li>
+<li><strong>Serviços stateful:</strong> os chat servers mantêm conexões WebSocket. O cliente fica conectado ao mesmo servidor enquanto ele estiver de pé.</li>
+<li><strong>Terceiros:</strong> push notifications para quem está offline.</li>
+</ul>
+<p><strong>Escala:</strong> 50 M DAU, com ~10 KB de memória por conexão, dá 500 GB. Até caberia num servidor enorme, mas seria um SPOF. Distribuímos entre muitos chat servers.</p>
+
+<h2 id="armazenamento">Armazenamento</h2>
+<p>Dados genéricos (usuários, settings, grupos, amigos) ficam em relacional com réplicas. <strong>Histórico de mensagens</strong> é diferente:</p>
+<ul>
+<li>Volume enorme: o Facebook Messenger e o WhatsApp processam 60 bilhões de mensagens por dia.</li>
+<li>Só as mensagens recentes são acessadas com frequência.</li>
+<li>Há acesso aleatório (busca, menções, pular para uma mensagem).</li>
+<li>Leitura e escrita na proporção de ~1:1.</li>
+</ul>
+<p>Escolha: <strong>key-value / wide-column</strong> (HBase no Messenger, Cassandra e depois ScyllaDB no Discord): escala horizontal e baixa latência; relacionais sofrem com índices enormes e acesso aleatório em larga escala.</p>
+<pre><code class="language-sql">-- 1:1
+CREATE TABLE message (
+  message_id bigint, message_from bigint, message_to bigint, content text, created_at timestamp,
+  PRIMARY KEY (message_id)
+);
+-- Grupo (e na prática também 1:1, usando um channel_id por conversa)
+CREATE TABLE group_message (
+  channel_id bigint, message_id bigint, user_id bigint, content text, created_at timestamp,
+  PRIMARY KEY ((channel_id), message_id)        -- partição por canal, ordenado por message_id
+);</code></pre>
+<p><strong>message_id</strong> precisa ser único e <strong>ordenável</strong> (timestamps colidem). Opções: auto_increment (não existe em NoSQL), <strong>Snowflake</strong> global, ou uma <strong>sequência local por canal</strong>, mais simples, porque a ordem só importa dentro de uma conversa.</p>
+
+<h2 id="fluxo-1-1">Fluxo 1:1</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">sequenceDiagram
+  participant A as Usuário A
+  participant CS1 as Chat server 1
+  participant ID as ID generator
+  participant Q as Fila de B
+  participant KV as KV store
+  participant CS2 as Chat server 2
+  participant B as Usuário B
+  A->>CS1: envia mensagem (WebSocket)
+  CS1->>ID: message_id
+  CS1->>Q: enfileira
+  Q->>KV: persiste
+  alt B online
+    Q->>CS2: entrega
+    CS2->>B: WebSocket
+  else B offline
+    Q->>B: push notification
+  end</pre></figure>
+<p>Como o CS1 sabe onde B está? Um registro <code>user_id → chat server</code> (no Redis, atualizado na conexão) ou um message bus pub/sub em que cada chat server assina os canais dos seus usuários conectados.</p>
+
+<h2 id="multi-device">Sincronização entre dispositivos</h2>
+<p>Cada dispositivo guarda <code>cur_max_message_id</code>, o último ID que viu. Ao reconectar, pede ao KV store todas as mensagens com <code>message_id &gt; cur_max_message_id</code> (cujo destinatário é o usuário logado). Como cada dispositivo tem seu próprio cursor, todos convergem.</p>
+<div class="code-title">go/chat/presence.go: sequência por canal + presença com heartbeat</div>
+<pre><code class="language-go" data-src="go/chat/presence.go">// Package chat contém duas peças de um sistema de chat:
+//
+//   - Presence: status online/offline via heartbeat. Em vez de marcar offline
+//     a cada desconexão do WebSocket (redes móveis oscilam!), o cliente manda
+//     um heartbeat a cada X s; se nada chegar em `timeout`, fica offline.
+//   - Inbox com sequência por canal: cada mensagem de um canal 1:1 ou grupo
+//     recebe um message_id crescente *local ao canal*, e o cliente sincroniza
+//     pedindo "tudo depois do meu cur_max_message_id".
+package chat
+
+import (
+	"sync"
+	"time"
+)
+
+type Presence struct {
+	mu       sync.Mutex
+	timeout  time.Duration
+	now      func() time.Time
+	lastBeat map[string]time.Time
+}
+
+func NewPresence(timeout time.Duration, now func() time.Time) *Presence {
+	if now == nil {
+		now = time.Now
+	}
+	return &amp;Presence{timeout: timeout, now: now, lastBeat: map[string]time.Time{}}
+}
+
+func (p *Presence) Heartbeat(user string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastBeat[user] = p.now()
+}
+
+func (p *Presence) Online(user string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	t, ok := p.lastBeat[user]
+	return ok &amp;&amp; p.now().Sub(t) &lt;= p.timeout
+}
+
+// ---------------------------------------------------------------------------
+
+type Message struct {
+	ChannelID string
+	Seq       int64 // crescente dentro do canal
+	From      string
+	Text      string
+}
+
+type Store struct {
+	mu       sync.Mutex
+	seq      map[string]int64 // em produção: INCR no Redis por canal, ou ID Snowflake
+	messages map[string][]Message
+}
+
+func NewStore() *Store { return &amp;Store{seq: map[string]int64{}, messages: map[string][]Message{}} }
+
+func (s *Store) Append(channel, from, text string) Message {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seq[channel]++
+	m := Message{ChannelID: channel, Seq: s.seq[channel], From: from, Text: text}
+	s.messages[channel] = append(s.messages[channel], m)
+	return m
+}
+
+// Since devolve as mensagens com Seq &gt; after — é o que um dispositivo pede ao reconectar.
+func (s *Store) Since(channel string, after int64) []Message {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	msgs := s.messages[channel]
+	// Seq começa em 1 e é contíguo, então o índice é direto.
+	if after &gt;= int64(len(msgs)) {
+		return nil
+	}
+	return append([]Message(nil), msgs[after:]...)
+}</code></pre>
+
+<h2 id="grupo">Chat em grupo</h2>
+<p>Grupos pequenos (≤ 100): a mensagem é copiada para a <strong>fila de sincronização (inbox) de cada membro</strong>. É simples, porque cada cliente só checa a própria inbox, e funciona bem para grupos pequenos; o WeChat usa essa abordagem com grupos de até 500. Para grupos enormes (canais do Discord/Slack com milhares de membros), copiar por membro é caro: guarda-se uma vez por canal, e cada cliente busca o canal (modelo pull, como o fanout on read).</p>
+
+<h2 id="presenca">Presença (online/offline)</h2>
+<ul>
+<li><strong>Login:</strong> com o WebSocket aberto, o status vira online e <code>last_active_at</code> é gravado no KV.</li>
+<li><strong>Logout:</strong> status offline.</li>
+<li><strong>Desconexão:</strong> redes móveis oscilam o tempo todo (passar num túnel). Mudar o status a cada queda geraria uma tempestade de eventos. Solução: <strong>heartbeat</strong>. O cliente envia um a cada ~5 s, e só depois de ~30 s sem heartbeat o status vira offline.</li>
+<li><strong>Fanout de presença:</strong> publica a mudança num canal por par de amigos ou por usuário, que os amigos online assinam. Para grupos grandes, é caro: busque o status sob demanda (ao abrir o grupo ou o perfil).</li>
+</ul>
+
+<h2 id="falhas">Falhas e extras</h2>
+<ul>
+<li><strong>Chat server cai:</strong> o service discovery fornece um novo servidor e os clientes reconectam e sincronizam pelo cursor.</li>
+<li><strong>Reenvio:</strong> o cliente reenvia mensagens não confirmadas, com um <code>client_message_id</code> para dedup no servidor.</li>
+<li><strong>Ordem:</strong> garantida por canal via message_id; Kafka particionado por channel_id preserva a ordem.</li>
+<li><strong>Mídia:</strong> upload para S3 via presigned URL; a mensagem leva só a referência; miniaturas e CDN.</li>
+<li><strong>E2E encryption:</strong> protocolo Signal; o servidor só retransmite bytes cifrados.</li>
+<li><strong>Cache no cliente:</strong> o histórico local reduz a carga.</li>
+<li><strong>Status de leitura</strong> (✓✓): eventos de "entregue" e "lido" no mesmo canal.</li>
+</ul>
+
+<h2 id="simulacao">Simulação de entrevista</h2>
+<div class="dialog">
+<p class="i">A está no servidor 7 e B no servidor 42. A envia uma mensagem. Mostre o caminho.</p>
+<p class="c">A envia pelo WebSocket ao servidor 7. O servidor 7 gera o message_id (sequência do canal A-B ou Snowflake), persiste no Cassandra (partição = channel_id), confirma para A com um ✓, e publica no message bus. Para saber onde B está, consulta o registro de sessões no Redis: <code>B → [servidor 42 (celular), servidor 13 (laptop)]</code>. Publica para os dois; cada servidor entrega pelo WebSocket correspondente. Se B não tiver nenhuma sessão, o evento vai ao serviço de push.</p>
+<p class="i">Por que persistir antes de entregar?</p>
+<p class="c">Para garantir durabilidade: se o servidor 42 cair no meio do caminho, a mensagem não se perde, porque quando B reconectar, o cliente pede tudo depois do seu <code>cur_max_message_id</code>. A entrega em tempo real é uma otimização sobre o histórico durável.</p>
+<p class="i">E se A enviar duas mensagens rapidamente e elas chegarem fora de ordem?</p>
+<p class="c">A ordem é definida pelo message_id no servidor, não pela chegada no cliente. O cliente ordena pelo id. Para que o servidor não inverta, as mensagens de um canal são processadas na mesma partição (por exemplo, Kafka com chave = channel_id), que é serial.</p>
+<p class="i">Como escalar para 500 milhões de conexões?</p>
+<p class="c">Um servidor bem ajustado segura centenas de milhares de WebSockets, então são alguns milhares de servidores. O LB precisa ser L4 ou suportar upgrade de WebSocket, e o balanceamento de conexões longas usa least-connections. Em deploys, drenamos conexões aos poucos para não causar uma tempestade de reconexões, e o cliente reconecta com backoff com jitter.</p>
+</div>
+
+<h2 id="quiz">Quiz</h2>
+<div class="quiz" data-answer="2"><div class="q">Por que heartbeat para presença em vez de marcar offline ao fechar a conexão?</div>
+<button class="opt">WebSocket não avisa desconexões</button><button class="opt">Para economizar banda</button><button class="opt">Conexões móveis caem e voltam com frequência; evitar oscilações de status</button><button class="opt">Exigência do APNs</button>
+<div class="why">Só marca offline após X segundos sem heartbeat.</div></div>
+<div class="quiz" data-answer="0"><div class="q">Como um novo dispositivo sabe quais mensagens buscar?</div>
+<button class="opt">Pelo cur_max_message_id do próprio dispositivo</button><button class="opt">Baixando todo o histórico sempre</button><button class="opt">Pelo timestamp do servidor de chat</button><button class="opt">Pela fila de push</button>
+<div class="why">Cada dispositivo tem seu cursor e pede as mensagens com id maior que ele.</div></div>
+<div class="quiz" data-answer="1"><div class="q">Melhor banco para bilhões de mensagens por dia, acessadas por conversa e em ordem?</div>
+<button class="opt">MySQL único</button><button class="opt">Wide-column (Cassandra/HBase) com partição por canal e clustering por message_id</button><button class="opt">Elasticsearch</button><button class="opt">Neo4j</button>
+<div class="why">Escrita horizontal e leitura ordenada dentro da partição.</div></div>
+
+<h2 id="recursos">Vídeos e leituras</h2>
+<ul class="links">
+<li class="read"><a href="https://discord.com/blog/how-discord-stores-billions-of-messages" target="_blank" rel="noopener">Discord: How Discord Stores Billions of Messages</a></li>
+<li class="read"><a href="https://discord.com/blog/how-discord-stores-trillions-of-messages" target="_blank" rel="noopener">Discord: How Discord Stores Trillions of Messages</a></li>
+<li class="read"><a href="https://slack.engineering/real-time-messaging/" target="_blank" rel="noopener">Slack Engineering: Real-time Messaging</a></li>
+<li class="read"><a href="https://www.hellointerview.com/learn/system-design/problem-breakdowns/whatsapp" target="_blank" rel="noopener">Hello Interview: WhatsApp</a></li>
+<li class="video"><a href="https://www.youtube.com/results?search_query=design+whatsapp+system+design+interview" target="_blank" rel="noopener">Vídeos: Design WhatsApp / chat</a></li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>

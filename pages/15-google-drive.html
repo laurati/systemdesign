@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Google Drive — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Capítulo 15 · Estudo de caso</span>
+<h1>Projete o Google Drive</h1>
+<p class="lead">Armazenamento e sincronização de arquivos (Drive, Dropbox, OneDrive). Desafios: não perder dados nunca, sincronizar vários dispositivos, economizar banda e lidar com edições conflitantes.</p>
+
+<div class="objectives"><h4>Ao final você saberá:</h4><ul>
+<li>Evoluir de um servidor único para uma arquitetura com S3, block servers e metadados.</li>
+<li>Dividir arquivos em blocos, fazer delta sync e deduplicar.</li>
+<li>Escolher long polling para notificar mudanças.</li>
+<li>Tratar conflitos de sincronização e garantir consistência dos metadados.</li>
+</ul></div>
+
+<h2 id="requisitos">Requisitos</h2>
+<div class="dialog">
+<p class="c">Funcionalidades mais importantes?</p><p class="i">Upload, download, sincronização e notificações.</p>
+<p class="c">Mobile e web?</p><p class="i">Os dois.</p>
+<p class="c">Formatos?</p><p class="i">Qualquer tipo.</p>
+<p class="c">Criptografia?</p><p class="i">Sim, em repouso.</p>
+<p class="c">Limite de tamanho?</p><p class="i">10 GB.</p>
+<p class="c">Usuários?</p><p class="i">10 milhões de DAU.</p>
+</div>
+<ul>
+<li>Adicionar arquivos (arrastar), baixar, sincronizar entre dispositivos, ver revisões, compartilhar, notificar sobre edições, exclusões e compartilhamentos.</li>
+<li>Fora do escopo: edição colaborativa em tempo real (Google Docs).</li>
+<li><strong>Não funcionais:</strong> confiabilidade (perder dados é inaceitável), sincronização rápida, eficiência de banda, escalabilidade, alta disponibilidade.</li>
+</ul>
+
+<h2 id="estimativas">Estimativas</h2>
+<ul>
+<li>50 M cadastrados, 10 M DAU; 10 GB grátis por usuário: 50 M × 10 GB = <strong>500 PB</strong> alocados.</li>
+<li>2 uploads/dia de 500 KB em média; leitura:escrita de 1:1.</li>
+<li>QPS de upload: 10 M × 2 / 10<sup>5</sup> ≈ <strong>240</strong>; pico ~480.</li>
+</ul>
+
+<h2 id="evolucao">Evolução do design</h2>
+<p><strong>Servidor único:</strong> Apache + MySQL + diretório <code>drive/namespace/arquivo</code>. Logo o disco enche.</p>
+<p><strong>Evolução:</strong></p>
+<ol>
+<li>Arquivos no <strong>S3</strong>, com replicação entre regiões (durabilidade).</li>
+<li><strong>Load balancer</strong> e web servers stateless.</li>
+<li><strong>Metadados</strong> (usuários, arquivos, blocos, versões) num banco separado, replicado e sharded.</li>
+</ol>
+
+<h2 id="alto-nivel">Arquitetura final</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  CL[Cliente: desktop, mobile, web] -->|blocos| BS[Block servers: split, compressão, criptografia]
+  BS --> S3[(Cloud storage: S3)]
+  S3 -.->|lifecycle| COLD[(Cold storage)]
+  CL -->|API: metadados| LB[LB] --> API[API servers]
+  API --> MC[(Metadata cache)]
+  API --> MDB[(Metadata DB)]
+  API --> NS[Notification service]
+  NS -->|long polling| CL
+  NS --> OQ[[Offline backup queue]]</pre></figure>
+<div class="table-wrap"><table>
+<tr><th>Componente</th><th>Papel</th></tr>
+<tr><td>Block servers</td><td>Dividem arquivos em blocos (até 4 MB, como no Dropbox), comprimem, criptografam e enviam ao S3; cada bloco é identificado pelo hash do conteúdo</td></tr>
+<tr><td>Cloud storage</td><td>Guarda os blocos</td></tr>
+<tr><td>Cold storage</td><td>Arquivos inativos há muito tempo (S3 Glacier)</td></tr>
+<tr><td>API servers</td><td>Autenticação, perfil, metadados de arquivos</td></tr>
+<tr><td>Metadata DB / cache</td><td>Usuários, arquivos, blocos, versões; cache para acesso rápido</td></tr>
+<tr><td>Notification service</td><td>Pub/sub que avisa os clientes de mudanças</td></tr>
+<tr><td>Offline backup queue</td><td>Guarda as mudanças para clientes offline, que as recebem ao voltar</td></tr>
+</table></div>
+
+<h2 id="blocos">Deep dive: blocos, delta sync e deduplicação</h2>
+<ul>
+<li><strong>Delta sync:</strong> ao modificar um arquivo, só os <strong>blocos alterados</strong> são enviados (o rsync faz algo semelhante).</li>
+<li><strong>Compressão</strong> por tipo: gzip/bzip2 para texto; codecs específicos para mídia.</li>
+<li><strong>Deduplicação:</strong> blocos com o mesmo hash são armazenados uma única vez, mesmo entre arquivos e usuários diferentes.</li>
+<li><strong>Retomada:</strong> uploads grandes continuam de onde pararam (bloco a bloco; S3 multipart).</li>
+</ul>
+<div class="code-title">go/filesync/blocks.go</div>
+<pre><code class="language-go" data-src="go/filesync/blocks.go">// Package filesync mostra a técnica central de um Google Drive / Dropbox:
+// dividir arquivos em blocos, identificar cada bloco pelo hash do conteúdo e,
+// numa atualização, enviar só os blocos que mudaram (delta sync).
+//
+// Benefícios: menos banda, retomada de upload, deduplicação entre arquivos e
+// usuários (mesmo hash = mesmo bloco guardado uma vez no object storage).
+package filesync
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+)
+
+// Block é a unidade de upload/armazenamento (Dropbox usa até 4 MB).
+type Block struct {
+	Index int
+	Hash  string
+	Data  []byte
+}
+
+// Split divide os dados em blocos de tamanho fixo.
+func Split(data []byte, size int) []Block {
+	var out []Block
+	for i := 0; i*size &lt; len(data); i++ {
+		end := min((i+1)*size, len(data))
+		chunk := data[i*size : end]
+		sum := sha256.Sum256(chunk)
+		out = append(out, Block{Index: i, Hash: hex.EncodeToString(sum[:]), Data: chunk})
+	}
+	return out
+}
+
+// Manifest é o que o serviço de metadados guarda por versão de arquivo:
+// a lista ordenada de hashes. O conteúdo vive no object storage (S3).
+func Manifest(blocks []Block) []string {
+	m := make([]string, len(blocks))
+	for i, b := range blocks {
+		m[i] = b.Hash
+	}
+	return m
+}
+
+// Changed devolve os blocos da nova versão que o servidor ainda não tem.
+// `known` = conjunto de hashes já armazenados (de qualquer arquivo → dedup).
+func Changed(newBlocks []Block, known map[string]bool) []Block {
+	var out []Block
+	for _, b := range newBlocks {
+		if !known[b.Hash] {
+			out = append(out, b)
+		}
+	}
+	return out
+}</code></pre>
+<pre><code class="language-text">$ go test ./filesync -v
+blocks_test.go: arquivo de 40970 bytes: enviados 2 de 11 blocos</code></pre>
+<div class="box tip"><strong class="t">Bônus: chunking por conteúdo (CDC)</strong>
+Com blocos de tamanho fixo, inserir um byte no início desloca todos os blocos seguintes e todos os hashes mudam. <em>Content-defined chunking</em> (rolling hash, como Rabin fingerprint) define as fronteiras pelo conteúdo, então uma inserção afeta só os blocos vizinhos. Muito usado em backup (restic, borg).</div>
+
+<h2 id="consistencia">Deep dive: alta consistência</h2>
+<p>Usuários diferentes não podem ver versões diferentes do mesmo arquivo ao mesmo tempo. Os <strong>metadados</strong> exigem consistência forte: um relacional com ACID (a escolha natural) ou um NoSQL com transações. O cache de metadados precisa ser invalidado na escrita, e réplicas de cache e banco devem estar consistentes.</p>
+<pre><code class="language-sql">users(user_id, name, email, ...)
+workspace(id, owner_id, is_shared, ...)
+file(id, workspace_id, file_name, relative_path, is_directory, latest_version, checksum, last_modified)
+file_version(file_id, version_number, device_id, last_modified)      -- somente leitura (histórico)
+block(block_hash, file_id, version, block_order)
+device(device_id, user_id, last_logged_in)</code></pre>
+
+<h2 id="upload">Fluxo de upload</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">sequenceDiagram
+  participant C1 as Cliente 1
+  participant API as API servers
+  participant DB as Metadata DB
+  participant BS as Block servers
+  participant S3 as Cloud storage
+  participant N as Notification
+  participant C2 as Cliente 2
+  par metadados
+    C1->>API: adiciona metadados do arquivo
+    API->>DB: status = pending
+    API->>N: arquivo novo
+    N->>C2: arquivo sendo enviado
+  and conteúdo
+    C1->>BS: envia blocos
+    BS->>S3: blocos comprimidos e criptografados
+    S3->>API: callback: upload completo
+    API->>DB: status = uploaded
+    API->>N: upload completo
+    N->>C2: baixar arquivo
+  end</pre></figure>
+<p><strong>Download:</strong> o cliente é notificado (ou consulta ao reconectar), pede os metadados atualizados, descobre quais blocos faltam e baixa só esses dos block servers, montando o arquivo localmente.</p>
+
+<h2 id="notificacao">Serviço de notificação: long polling × WebSocket</h2>
+<p>O Dropbox usa <strong>long polling</strong>, e faz sentido: a comunicação é unidirecional (servidor avisa "há mudanças"), as notificações são pouco frequentes e não há rajadas de dados. WebSocket seria mais adequado para comunicação bidirecional e em tempo real, como chat. Ao receber a resposta (ou timeout), o cliente busca as mudanças nos metadados e abre um novo long poll.</p>
+
+<h2 id="conflitos">Conflitos de sincronização</h2>
+<p>Dois usuários (ou dispositivos) editam o mesmo arquivo ao mesmo tempo. Estratégia: <strong>a primeira versão processada vence</strong>; a outra recebe um conflito. O cliente fica com as duas cópias (<code>arquivo.txt</code> e <code>arquivo (cópia em conflito de Ana).txt</code>) e o usuário escolhe como mesclar.</p>
+<p>A detecção usa a <strong>versão base</strong>: o cliente envia "minha edição parte da versão 7"; se o servidor já está na versão 8, há conflito. É lock otimista com <code>UPDATE file SET latest_version = 8 WHERE id = ? AND latest_version = 7</code>.</p>
+
+<h2 id="economia">Economizando espaço</h2>
+<ul>
+<li><strong>Deduplicação</strong> de blocos por hash na conta (ou globalmente).</li>
+<li><strong>Política de backup inteligente:</strong> limitar o número de versões guardadas; manter só versões importantes (as edições frequentes de um documento grande criam muitas versões).</li>
+<li><strong>Dados frios</strong> para cold storage (meses sem acesso).</li>
+</ul>
+
+<h2 id="falhas">Falhas</h2>
+<ul>
+<li><strong>LB:</strong> par ativo/passivo com heartbeat.</li>
+<li><strong>Block server:</strong> outros assumem os jobs pendentes.</li>
+<li><strong>Cloud storage:</strong> buckets replicados em várias regiões.</li>
+<li><strong>API server:</strong> stateless.</li>
+<li><strong>Metadata cache/DB:</strong> réplicas; promover uma nova primária.</li>
+<li><strong>Notification service:</strong> cada servidor segura muitas conexões long poll; se cair, os clientes reconectam a outro (reconexão em massa é lenta: limite e espalhe).</li>
+<li><strong>Offline backup queue:</strong> filas replicadas.</li>
+</ul>
+
+<h2 id="simulacao">Simulação de entrevista</h2>
+<div class="dialog">
+<p class="i">Uma usuária edita uma linha num arquivo de 2 GB. Quanto ela envia?</p>
+<p class="c">Com blocos de 4 MB, o cliente recalcula os hashes, compara com o manifest da versão anterior e envia só o bloco alterado: ~4 MB em vez de 2 GB, e menos ainda comprimido. Se a edição inseriu bytes (em vez de sobrescrever), blocos de tamanho fixo deslocariam tudo depois do ponto de inserção; com content-defined chunking, só um ou dois blocos mudam.</p>
+<p class="i">Por que separar os block servers dos API servers?</p>
+<p class="c">São cargas muito diferentes. Block servers lidam com bytes: CPU para hash, compressão e criptografia, e muita banda. API servers lidam com metadados: muitas requisições pequenas e transacionais. Separados, cada um escala no seu eixo. Uma alternativa é o cliente fazer o chunking e mandar direto para o S3 com presigned URLs, tirando os bytes dos nossos servidores, mas aí a criptografia e a deduplicação ficam no cliente.</p>
+<p class="i">Dois laptops da mesma pessoa editaram o arquivo offline. Ela conecta os dois. E agora?</p>
+<p class="c">O primeiro a sincronizar envia "edição sobre a versão 7"; o servidor aceita e vira a versão 8. O segundo também diz "sobre a versão 7", mas o servidor está na 8: conflito. Esse cliente baixa a versão 8, renomeia a sua como cópia em conflito e envia as duas. Nada se perde e a decisão fica com a usuária.</p>
+</div>
+
+<h2 id="quiz">Quiz</h2>
+<div class="quiz" data-answer="0"><div class="q">Por que long polling no serviço de notificação?</div>
+<button class="opt">Notificações são pouco frequentes e unidirecionais</button><button class="opt">É mais rápido que WebSocket</button><button class="opt">Permite enviar blocos</button><button class="opt">É exigência do S3</button>
+<div class="why">WebSocket compensa quando há tráfego bidirecional frequente.</div></div>
+<div class="quiz" data-answer="2"><div class="q">O que permite deduplicar arquivos entre usuários?</div>
+<button class="opt">Compressão</button><button class="opt">Criptografia</button><button class="opt">Identificar blocos pelo hash do conteúdo</button><button class="opt">Long polling</button>
+<div class="why">Mesmo hash, mesmo conteúdo: guardado uma vez.</div></div>
+<div class="quiz" data-answer="3"><div class="q">Qual parte do sistema exige consistência forte?</div>
+<button class="opt">A CDN</button><button class="opt">O cold storage</button><button class="opt">A fila offline</button><button class="opt">Os metadados (versão, lista de blocos)</button>
+<div class="why">Os blocos são imutáveis; quem decide "qual é a versão atual" são os metadados.</div></div>
+
+<h2 id="recursos">Vídeos e leituras</h2>
+<ul class="links">
+<li class="read"><a href="https://dropbox.tech/infrastructure/streaming-file-synchronization" target="_blank" rel="noopener">Dropbox: Streaming File Synchronization</a></li>
+<li class="read"><a href="https://dropbox.tech/infrastructure/rewriting-the-heart-of-our-sync-engine" target="_blank" rel="noopener">Dropbox: Rewriting the heart of our sync engine</a></li>
+<li class="read"><a href="https://www.hellointerview.com/learn/system-design/problem-breakdowns/dropbox" target="_blank" rel="noopener">Hello Interview: Dropbox</a></li>
+<li class="video"><a href="https://www.youtube.com/results?search_query=design+google+drive+dropbox+system+design+interview" target="_blank" rel="noopener">Vídeos: Design Dropbox / Google Drive</a></li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>

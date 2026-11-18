@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cola para o dia da entrevista — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Prática · Revisão</span>
+<h1>Cola para o dia da entrevista</h1>
+<p class="lead">Uma página para revisar na véspera e 30 minutos antes. Imprima se quiser (o layout de impressão esconde os menus).</p>
+
+<h2 id="roteiro">Roteiro de 45 minutos</h2>
+<div class="table-wrap"><table>
+<tr><th>Min</th><th>Fase</th><th>Checklist</th></tr>
+<tr><td>0–5</td><td>Requisitos</td><td>Funcionalidades (2–3) · fora do escopo · usuários/DAU · leitura × escrita · latência · consistência × disponibilidade · retenção</td></tr>
+<tr><td>5–8</td><td>Estimativas</td><td>QPS (média e pico) · armazenamento · banda · e <em>que decisão isso implica</em></td></tr>
+<tr><td>8–12</td><td>API + dados</td><td>Endpoints principais · entidades · chave de acesso · banco e por quê</td></tr>
+<tr><td>12–22</td><td>Alto nível</td><td>Cliente → LB → serviços → dados/cache/fila/CDN · percorrer cada fluxo · pedir buy-in</td></tr>
+<tr><td>22–40</td><td>Deep dives</td><td>2–3 componentes críticos: escala, consistência, falhas, hotspots</td></tr>
+<tr><td>40–45</td><td>Fechamento</td><td>Gargalos · monitoramento · evolução 10× · recapitular</td></tr>
+</table></div>
+
+<h2 id="numeros">Números</h2>
+<div class="grid">
+<div class="card"><h4>Tempo</h4><p>1 dia ≈ 10<sup>5</sup> s · 1 mês ≈ 2,5 × 10<sup>6</sup> s · 1 ano ≈ 3 × 10<sup>7</sup> s</p></div>
+<div class="card"><h4>QPS</h4><p>1 M req/dia ≈ 12/s · 100 M/dia ≈ 1.200/s · 1 bi/dia ≈ 12 mil/s</p></div>
+<div class="card"><h4>Latência</h4><p>RAM 100 ns · SSD aleatório 16 µs · mesmo DC 0,5 ms · HDD seek 10 ms · cross-continente 150 ms</p></div>
+<div class="card"><h4>Disponibilidade</h4><p>99,9% = 8,8 h/ano · 99,99% = 53 min/ano · 99,999% = 5 min/ano</p></div>
+<div class="card"><h4>Capacidade (ordem de grandeza)</h4><p>Web server 1–10k req/s · Postgres ~5–20k escritas/s · Redis ~100k ops/s · Kafka partição ~10 MB/s · WS ~100k–1M conexões/servidor</p></div>
+<div class="card"><h4>Tamanhos</h4><p>int64 8 B · UUID 16 B · tweet ~300 B · foto ~200 KB–2 MB · 1 min de vídeo HD ~50–100 MB</p></div>
+</div>
+
+<h2 id="padroes">Padrões que resolvem 80% dos problemas</h2>
+<div class="table-wrap"><table>
+<tr><th>Problema</th><th>Padrão</th></tr>
+<tr><td>Muita leitura</td><td>Cache (cache-aside) + réplicas + CDN</td></tr>
+<tr><td>Muita escrita</td><td>Sharding · LSM/wide-column · fila + batch · write-behind</td></tr>
+<tr><td>Trabalho lento ou instável</td><td>Fila + workers assíncronos + retry/DLQ</td></tr>
+<tr><td>Arquivos grandes</td><td>Presigned URL + multipart + S3 + CDN</td></tr>
+<tr><td>Tempo real para o cliente</td><td>WebSocket / SSE + pub/sub entre servidores</td></tr>
+<tr><td>Contenção (estoque, assento)</td><td>Update condicional atômico · lock com TTL · fila virtual</td></tr>
+<tr><td>Duplicatas</td><td>Idempotency key + UNIQUE · dedup no consumidor</td></tr>
+<tr><td>Hot key</td><td>Cache local · réplicas da chave · sub-chaves com sufixo</td></tr>
+<tr><td>Celebridade (fanout)</td><td>Híbrido push/pull</td></tr>
+<tr><td>Busca textual</td><td>Elasticsearch via CDC</td></tr>
+<tr><td>Proximidade</td><td>Geohash / quadtree / H3 / Redis GEO</td></tr>
+<tr><td>Top-K / contagem em stream</td><td>Kafka + Flink · Count-Min Sketch + heap</td></tr>
+<tr><td>Ranking</td><td>Redis sorted set</td></tr>
+<tr><td>Dual write banco + evento</td><td>Transactional outbox / CDC</td></tr>
+<tr><td>Transação entre serviços</td><td>Saga (orquestrada) com compensação</td></tr>
+<tr><td>Distribuir chaves entre nós</td><td>Consistent hashing / partições fixas</td></tr>
+<tr><td>Coordenação/líder</td><td>etcd/ZooKeeper com lease + fencing</td></tr>
+</table></div>
+
+<h2 id="deep-dive">Checklist de cada deep dive</h2>
+<ul>
+<li><strong>Dados:</strong> qual o padrão de acesso? Qual a chave de partição? Existe hotspot?</li>
+<li><strong>Escala:</strong> o que acontece com 10× de tráfego? Onde quebra primeiro?</li>
+<li><strong>Consistência:</strong> esse dado pode estar atrasado? Quanto? O que acontece em escritas concorrentes?</li>
+<li><strong>Falhas:</strong> o que acontece se este componente cair? E se ficar lento? Há retry? É idempotente?</li>
+<li><strong>Operação:</strong> como saberei que está quebrado (métricas/alertas)? Como faço deploy sem downtime?</li>
+<li><strong>Custo:</strong> qual o componente mais caro? Dá para reduzir?</li>
+</ul>
+
+<h2 id="frases">Frases</h2>
+<ul>
+<li>"Antes de desenhar, quero alinhar o escopo com algumas perguntas."</li>
+<li>"Vou assumir X; me corrija se estiver fora do que você imaginou."</li>
+<li>"Esse número me diz que… então vou…"</li>
+<li>"Temos duas opções. A… B… Dado que priorizamos X, escolho A, e o custo disso é…"</li>
+<li>"O ponto fraco deste design é…; com mais tempo eu…"</li>
+<li>"Quer que eu aprofunde em X ou prefere outra parte?"</li>
+</ul>
+
+<h2 id="red-flags">Sinais de alerta (evite)</h2>
+<ul>
+<li>Começar a desenhar sem perguntar nada.</li>
+<li>Silêncio longo; pense em voz alta.</li>
+<li>"Usei Kafka/Kubernetes/microsserviços" sem justificativa.</li>
+<li>Ignorar as dicas do entrevistador.</li>
+<li>Over-engineering para 1.000 usuários.</li>
+<li>Nunca mencionar falhas, consistência ou números.</li>
+<li>Dizer "é eventualmente consistente" sem dizer o quanto nem o impacto para o usuário.</li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>

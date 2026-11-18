@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System Design na Prática — preparação para entrevistas</title>
+<meta name="description" content="Estudo completo de System Design para entrevistas: fundamentos, quando usar cada ferramenta, 12 estudos de caso, simulador de entrevistas, exercícios e exemplos em Go.">
+<link rel="stylesheet" href="css/style.css">
+<script src="js/site.js" defer></script>
+</head>
+<body data-root=".">
+<main>
+<article class="content">
+
+<section class="hero">
+  <span class="kicker" style="color:#c7d2fe">Preparação para entrevistas</span>
+  <h1>System Design na Prática</h1>
+  <p>Aprenda a projetar sistemas que escalam para milhões de usuários e a <strong>defender suas decisões</strong> numa entrevista de 45 minutos: fundamentos, quando usar cada ferramenta, 12 estudos de caso, simulações e exercícios, com exemplos em Go.</p>
+  <p style="margin-top:20px">
+    <a class="btn" href="pages/guia.html">Começar pelo guia</a>
+    <a class="btn ghost" href="pages/simulacoes.html">Ir para o simulador</a>
+  </p>
+</section>
+
+<h2 id="progresso">Seu progresso</h2>
+<div id="progress" class="card"></div>
+
+<h2 id="como">Como este site está organizado</h2>
+<div class="grid">
+  <div class="card"><h4>1. Fundamentos</h4><p>Como um sistema evolui de 1 servidor para milhões de usuários, como fazer estimativas rápidas e o roteiro de 4 passos para conduzir a entrevista.</p></div>
+  <div class="card"><h4>2. Blocos de construção</h4><p>Bancos SQL e NoSQL, caches, filas, CDNs, balanceadores, consistência, replicação, sharding. Para cada um: <em>quando usar e quando não usar</em>.</p></div>
+  <div class="card"><h4>3. Estudos de caso</h4><p>12 sistemas clássicos, cada um com requisitos, estimativas, diagramas, aprofundamentos, código Go testado, um diálogo de entrevista e um quiz.</p></div>
+  <div class="card"><h4>4. Prática</h4><p>Simulador de entrevista com cronômetro e rubrica, mais de 100 exercícios (estimativas, trade-offs, design, código) e uma cola para revisar antes da entrevista.</p></div>
+</div>
+
+<h2 id="fundamentos">Fundamentos</h2>
+<div class="grid">
+  <a class="card" href="pages/01-escala.html"><span class="num">CAPÍTULO 01</span><h4>De zero a milhões de usuários</h4><p>Load balancer, réplicas, cache, CDN, stateless, multi-datacenter, filas, sharding.</p></a>
+  <a class="card" href="pages/02-estimativas.html"><span class="num">CAPÍTULO 02</span><h4>Estimativas</h4><p>Potências de 2, latências que todo engenheiro deve saber, QPS, armazenamento, disponibilidade.</p></a>
+  <a class="card" href="pages/03-framework.html"><span class="num">CAPÍTULO 03</span><h4>Framework da entrevista</h4><p>Os 4 passos, como gastar os 45 minutos, o que fazer e o que evitar.</p></a>
+  <a class="card" href="pages/ferramentas.html"><span class="num">GUIA DE DECISÃO</span><h4>Qual ferramenta usar?</h4><p>PostgreSQL × Cassandra × DynamoDB × Redis × Kafka × RabbitMQ × S3 × Elasticsearch…</p></a>
+  <a class="card" href="pages/distribuidos.html"><span class="num">TEORIA</span><h4>Sistemas distribuídos</h4><p>CAP, PACELC, consistência, quórum, consenso, idempotência, exactly-once, sagas.</p></a>
+</div>
+
+<h2 id="casos">Estudos de caso</h2>
+<div class="grid">
+  <a class="card" href="pages/04-rate-limiter.html"><span class="num">04</span><h4>Rate limiter</h4><p>Token bucket, sliding window, Redis, limites distribuídos.</p><span class="tag medium">médio</span><span class="tag">Go</span></a>
+  <a class="card" href="pages/05-consistent-hashing.html"><span class="num">05</span><h4>Consistent hashing</h4><p>Anel de hash, nós virtuais, rebalanceamento mínimo.</p><span class="tag medium">médio</span><span class="tag">Go</span></a>
+  <a class="card" href="pages/06-key-value-store.html"><span class="num">06</span><h4>Key-value store</h4><p>CAP, quórum, vector clocks, gossip, hinted handoff, Merkle trees.</p><span class="tag hard">difícil</span><span class="tag">Go</span></a>
+  <a class="card" href="pages/07-unique-id.html"><span class="num">07</span><h4>Gerador de IDs únicos</h4><p>UUID, ticket server, Snowflake.</p><span class="tag easy">fácil</span><span class="tag">Go</span></a>
+  <a class="card" href="pages/08-url-shortener.html"><span class="num">08</span><h4>Encurtador de URL</h4><p>Base62, hash + colisão, 301 × 302, cache.</p><span class="tag easy">fácil</span><span class="tag">Go</span></a>
+  <a class="card" href="pages/09-web-crawler.html"><span class="num">09</span><h4>Web crawler</h4><p>URL frontier, politeness, dedup, robots.txt, armadilhas.</p><span class="tag medium">médio</span><span class="tag">Go</span></a>
+  <a class="card" href="pages/10-notificacoes.html"><span class="num">10</span><h4>Notificações</h4><p>Push, SMS, e-mail, filas, retry, idempotência.</p><span class="tag medium">médio</span><span class="tag">Go</span></a>
+  <a class="card" href="pages/11-news-feed.html"><span class="num">11</span><h4>News feed</h4><p>Fanout on write × on read, celebridades, caches em camadas.</p><span class="tag medium">médio</span><span class="tag">Go</span></a>
+  <a class="card" href="pages/12-chat.html"><span class="num">12</span><h4>Chat</h4><p>WebSocket, presença, multi-dispositivo, armazenamento de mensagens.</p><span class="tag hard">difícil</span><span class="tag">Go</span></a>
+  <a class="card" href="pages/13-autocomplete.html"><span class="num">13</span><h4>Autocomplete</h4><p>Trie com top-k, pipeline de dados, cache no browser.</p><span class="tag medium">médio</span><span class="tag">Go</span></a>
+  <a class="card" href="pages/14-youtube.html"><span class="num">14</span><h4>YouTube</h4><p>Upload, transcodificação com DAG, streaming adaptativo, CDN.</p><span class="tag hard">difícil</span></a>
+  <a class="card" href="pages/15-google-drive.html"><span class="num">15</span><h4>Google Drive</h4><p>Blocos, delta sync, deduplicação, conflitos, long polling.</p><span class="tag hard">difícil</span><span class="tag">Go</span></a>
+</div>
+
+<h2 id="pratica">Prática</h2>
+<div class="grid">
+  <a class="card" href="pages/simulacoes.html"><span class="num">SIMULADOR</span><h4>Simulações de entrevista</h4><p>25 problemas com cronômetro de 45 min, perguntas do entrevistador, resposta-modelo por fase, perguntas-surpresa e rubrica de avaliação.</p></a>
+  <a class="card" href="pages/exercicios.html"><span class="num">EXERCÍCIOS</span><h4>Mais de 100 exercícios</h4><p>Estimativas, conceitos, "qual ferramenta?", trade-offs, mini-designs e código Go, com solução.</p></a>
+  <a class="card" href="pages/cola.html"><span class="num">REVISÃO</span><h4>Cola para o dia da entrevista</h4><p>Números, roteiro, frases para usar e checklist de deep dives.</p></a>
+  <a class="card" href="pages/recursos.html"><span class="num">LINKS</span><h4>Cursos, vídeos e leituras</h4><p>ByteByteGo, Hello Interview, MIT 6.824, DDIA, papers clássicos e blogs de engenharia.</p></a>
+</div>
+
+<div class="box info">
+  <strong class="t">Código Go testado</strong>
+  Todos os exemplos de implementação estão na pasta <code>go/</code> do repositório, com testes. Clone o repositório e rode <code>cd go &amp;&amp; go test ./... -v</code> para ver, por exemplo, quantas chaves um anel de consistent hashing move ao ganhar um servidor.
+</div>
+
+</article>
+</main>
+</body>
+</html>

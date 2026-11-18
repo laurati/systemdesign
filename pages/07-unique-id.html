@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Gerador de IDs únicos — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Capítulo 07 · Estudo de caso</span>
+<h1>Projete um gerador de IDs únicos distribuído</h1>
+<p class="lead">Num único banco, <code>AUTO_INCREMENT</code> resolve. Em dezenas de servidores gerando milhares de IDs por segundo, sem coordenação e com IDs ordenáveis por tempo, é outro problema.</p>
+
+<div class="objectives"><h4>Ao final você saberá:</h4><ul>
+<li>Comparar multi-master, UUID, ticket server e Snowflake.</li>
+<li>Montar o layout de 64 bits do Snowflake e calcular seus limites.</li>
+<li>Lidar com relógio voltando no tempo e esgotamento de sequência.</li>
+<li>Implementar o Snowflake em Go.</li>
+</ul></div>
+
+<h2 id="requisitos">Requisitos</h2>
+<div class="dialog">
+<p class="c">Quais as características dos IDs?</p><p class="i">Únicos e ordenáveis.</p>
+<p class="c">Cada novo registro tem um ID maior que o anterior?</p><p class="i">IDs aumentam com o tempo, mas não necessariamente de 1 em 1. IDs criados à noite são maiores que os da manhã do mesmo dia.</p>
+<p class="c">Só numéricos?</p><p class="i">Sim.</p>
+<p class="c">Tamanho?</p><p class="i">64 bits.</p>
+<p class="c">Escala?</p><p class="i">10.000 IDs por segundo.</p>
+</div>
+
+<h2 id="opcoes">As opções</h2>
+
+<h3>1. Multi-master replication</h3>
+<p>Cada um dos <em>k</em> servidores de banco usa auto_increment com passo <em>k</em>: o servidor 1 gera 1, 3, 5…; o servidor 2 gera 2, 4, 6…</p>
+<div class="procon"><div class="pro"><h5>Prós</h5><ul><li>Simples, usa o banco</li></ul></div><div class="con"><h5>Contras</h5><ul><li>Difícil escalar para múltiplos DCs</li><li>IDs não crescem com o tempo entre servidores</li><li>Adicionar ou remover servidores muda o passo</li></ul></div></div>
+
+<h3>2. UUID</h3>
+<p>128 bits gerados localmente (v4 aleatório; v7 ordenado por tempo). A chance de colisão é desprezível: gerar 1 bilhão por segundo durante 100 anos para ter 50% de chance de uma duplicata.</p>
+<div class="procon"><div class="pro"><h5>Prós</h5><ul><li>Zero coordenação, cada servidor gera o seu</li><li>Escala trivialmente</li></ul></div><div class="con"><h5>Contras</h5><ul><li><strong>128 bits</strong> (requisito: 64)</li><li>UUIDv4 não é ordenável por tempo e espalha inserções no índice B-tree (pior desempenho de escrita)</li><li>Não numérico</li></ul></div></div>
+<div class="box tip"><strong class="t">Fora da entrevista</strong>UUIDv7 (RFC 9562) tem timestamp nos bits mais significativos e resolve a ordenação e a localidade no índice. É uma ótima escolha padrão quando 128 bits são aceitáveis.</div>
+
+<h3>3. Ticket server</h3>
+<p>Um banco central com auto_increment distribui IDs (abordagem do Flickr). Os servidores pedem IDs a ele, muitas vezes em <strong>blocos</strong> (pegue 1.000 de uma vez e distribua localmente).</p>
+<div class="procon"><div class="pro"><h5>Prós</h5><ul><li>IDs numéricos, simples</li><li>Bom para escala pequena e média</li></ul></div><div class="con"><h5>Contras</h5><ul><li><strong>Ponto único de falha</strong>; com vários ticket servers voltam os problemas de sincronização</li></ul></div></div>
+
+<h3>4. Twitter Snowflake</h3>
+<p>Dividir para conquistar: o ID de 64 bits é composto por seções.</p>
+<div class="table-wrap"><table>
+<tr><th>Bits</th><th>Seção</th><th>Descrição</th></tr>
+<tr><td>1</td><td>Sinal</td><td>Sempre 0 (reservado; mantém o int64 positivo)</td></tr>
+<tr><td>41</td><td>Timestamp</td><td>Milissegundos desde uma epoch customizada. 2<sup>41</sup> ms ≈ <strong>69 anos</strong></td></tr>
+<tr><td>5</td><td>Datacenter ID</td><td>2<sup>5</sup> = 32 datacenters</td></tr>
+<tr><td>5</td><td>Machine ID</td><td>32 máquinas por DC</td></tr>
+<tr><td>12</td><td>Sequência</td><td>Incrementa a cada ID no mesmo ms e zera a cada novo ms. 2<sup>12</sup> = <strong>4096 IDs/ms por máquina</strong></td></tr>
+</table></div>
+<p>Capacidade: 4096 × 1000 = ~4 milhões de IDs/s <em>por máquina</em>, muito acima dos 10 mil exigidos. Os IDs são ordenáveis por tempo porque o timestamp está nos bits mais significativos.</p>
+
+<h2 id="comparacao">Comparação</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Multi-master</th><th>UUID v4</th><th>Ticket server</th><th>Snowflake</th></tr>
+<tr><td>64 bits</td><td>✅</td><td>❌</td><td>✅</td><td>✅</td></tr>
+<tr><td>Ordenável por tempo</td><td>❌</td><td>❌</td><td>✅</td><td>✅ (aproximadamente)</td></tr>
+<tr><td>Sem SPOF</td><td>~</td><td>✅</td><td>❌</td><td>✅</td></tr>
+<tr><td>Sem coordenação por ID</td><td>❌</td><td>✅</td><td>❌</td><td>✅</td></tr>
+<tr><td>Alta escala</td><td>~</td><td>✅</td><td>~</td><td>✅</td></tr>
+</table></div>
+
+<h2 id="codigo">Implementação em Go</h2>
+<div class="code-title">go/snowflake/snowflake.go</div>
+<pre><code class="language-go" data-src="go/snowflake/snowflake.go">// Package snowflake gera IDs únicos de 64 bits, ordenáveis por tempo, sem
+// coordenação entre máquinas (abordagem do Twitter Snowflake).
+//
+// Layout (64 bits):
+//
+//	| 1 bit sinal | 41 bits timestamp (ms desde epoch) | 5 bits datacenter | 5 bits máquina | 12 bits sequência |
+//
+// - 41 bits de ms ≈ 69 anos a partir da epoch customizada.
+// - 5+5 bits = até 32 datacenters × 32 máquinas.
+// - 12 bits = 4096 IDs por milissegundo por máquina.
+package snowflake
+
+import (
+	"errors"
+	"sync"
+	"time"
+)
+
+const (
+	datacenterBits = 5
+	machineBits    = 5
+	sequenceBits   = 12
+
+	maxDatacenter = -1 ^ (-1 &lt;&lt; datacenterBits) // 31
+	maxMachine    = -1 ^ (-1 &lt;&lt; machineBits)    // 31
+	maxSequence   = -1 ^ (-1 &lt;&lt; sequenceBits)   // 4095
+
+	machineShift    = sequenceBits
+	datacenterShift = sequenceBits + machineBits
+	timestampShift  = sequenceBits + machineBits + datacenterBits
+)
+
+// Epoch customizada (2026-01-01). Começar perto de "agora" maximiza a vida útil.
+var Epoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+var ErrClockMovedBackwards = errors.New("snowflake: relógio voltou no tempo")
+
+type Generator struct {
+	mu         sync.Mutex
+	datacenter int64
+	machine    int64
+	lastMs     int64
+	sequence   int64
+	now        func() time.Time
+}
+
+func New(datacenter, machine int64) (*Generator, error) {
+	if datacenter &lt; 0 || datacenter &gt; maxDatacenter || machine &lt; 0 || machine &gt; maxMachine {
+		return nil, errors.New("snowflake: datacenter/machine fora do intervalo 0..31")
+	}
+	return &amp;Generator{datacenter: datacenter, machine: machine, lastMs: -1, now: time.Now}, nil
+}
+
+func (g *Generator) Next() (int64, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	ms := g.now().Sub(Epoch).Milliseconds()
+	if ms &lt; g.lastMs {
+		// NTP pode atrasar o relógio. Emitir IDs agora poderia gerar duplicatas.
+		return 0, ErrClockMovedBackwards
+	}
+	if ms == g.lastMs {
+		g.sequence = (g.sequence + 1) &amp; maxSequence
+		if g.sequence == 0 {
+			// 4096 IDs esgotados neste ms: espera o próximo milissegundo.
+			for ms &lt;= g.lastMs {
+				ms = g.now().Sub(Epoch).Milliseconds()
+			}
+		}
+	} else {
+		g.sequence = 0
+	}
+	g.lastMs = ms
+
+	return ms&lt;&lt;timestampShift |
+		g.datacenter&lt;&lt;datacenterShift |
+		g.machine&lt;&lt;machineShift |
+		g.sequence, nil
+}
+
+// Parts decompõe um ID — útil para depuração ("quando este ID foi criado?").
+func Parts(id int64) (ts time.Time, datacenter, machine, sequence int64) {
+	ms := id &gt;&gt; timestampShift
+	return Epoch.Add(time.Duration(ms) * time.Millisecond),
+		(id &gt;&gt; datacenterShift) &amp; maxDatacenter,
+		(id &gt;&gt; machineShift) &amp; maxMachine,
+		id &amp; maxSequence
+}</code></pre>
+<p>O teste gera 160 mil IDs em 8 goroutines e verifica unicidade e ordem crescente por goroutine:</p>
+<div class="code-title">go/snowflake/snowflake_test.go (trecho)</div>
+<pre><code class="language-go" data-src="go/snowflake/snowflake_test.go" data-lines="9-43">func TestUniqueAndSortedConcurrent(t *testing.T) {
+	g, _ := New(1, 7)
+	const workers, perWorker = 8, 20000
+	var mu sync.Mutex
+	seen := make(map[int64]bool, workers*perWorker)
+	var wg sync.WaitGroup
+	for w := 0; w &lt; workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			local := make([]int64, 0, perWorker)
+			for i := 0; i &lt; perWorker; i++ {
+				id, err := g.Next()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if len(local) &gt; 0 &amp;&amp; id &lt;= local[len(local)-1] {
+					t.Error("IDs de uma mesma goroutine devem ser crescentes")
+					return
+				}
+				local = append(local, id)
+			}
+			mu.Lock()
+			for _, id := range local {
+				if seen[id] {
+					t.Errorf("ID duplicado: %d", id)
+				}
+				seen[id] = true
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+}</code></pre>
+
+<h2 id="deep-dive">Deep dive: detalhes que impressionam</h2>
+<h3>Sincronização de relógio</h3>
+<p>Assumimos que as máquinas têm relógios razoavelmente sincronizados (NTP). Se o relógio de uma máquina <strong>voltar no tempo</strong> (ajuste do NTP), ela poderia gerar IDs repetidos. Opções: recusar gerar e retornar erro (o que nossa implementação faz), esperar até o relógio alcançar o último timestamp usado, ou usar um "relógio lógico" que nunca volta.</p>
+<h3>Atribuição de machine ID</h3>
+<p>Cada instância precisa de um ID único de 0 a 31. Fixar em config é frágil com autoscaling. Melhor: registrar-se no <strong>ZooKeeper/etcd</strong> e obter um ID livre com lease (liberado se a instância morrer), ou derivar do ordinal de um StatefulSet do Kubernetes.</p>
+<h3>Ajustando os bits</h3>
+<p>Poucos DCs e máquinas, mas muita concorrência? Tire bits de DC/máquina e dê à sequência. Precisa de mais tempo de vida? Use segundos em vez de ms (mas a sequência precisa de mais bits). A epoch customizada (por exemplo, a data de lançamento do produto) maximiza a vida útil.</p>
+<h3>Alta disponibilidade</h3>
+<p>Geradores são stateless (fora o machine ID). Podem ser uma biblioteca embutida em cada serviço (latência zero) ou um serviço dedicado com várias instâncias.</p>
+<h3>Ordenação não é estrita</h3>
+<p>IDs de máquinas diferentes no mesmo ms não têm ordem definida, e o desvio de relógio entre máquinas (alguns ms) pode inverter a ordem. Para "ordenar posts por tempo" isso é irrelevante; para um log que exige ordem total, não serve (use um sequenciador único ou consenso).</p>
+
+<h2 id="variacoes">Variações no mundo real</h2>
+<ul>
+<li><strong>Instagram:</strong> IDs gerados dentro do PostgreSQL via função PL/pgSQL (41 bits de tempo + 13 de shard lógico + 10 de sequência).</li>
+<li><strong>Discord:</strong> Snowflake com epoch em 2015, usado como ID de mensagem e chave de clustering no Cassandra.</li>
+<li><strong>Sonyflake:</strong> 39 bits de tempo em unidades de 10 ms (174 anos), 8 de sequência, 16 de máquina.</li>
+<li><strong>ULID / KSUID / UUIDv7:</strong> 128 bits ordenáveis por tempo, sem necessidade de machine ID.</li>
+</ul>
+
+<h2 id="simulacao">Simulação de entrevista</h2>
+<div class="dialog">
+<p class="i">Precisamos de IDs para os pedidos de um marketplace. Proposta?</p>
+<p class="c">Os IDs aparecem para o usuário ou são só internos? Precisam ser ordenáveis? Existe restrição de tamanho?</p>
+<p class="i">Aparecem na nota fiscal e no app. Ordenáveis seria bom. Volume: uns 2 mil pedidos/s no pico.</p>
+<p class="c">Por serem expostos, eu evitaria IDs sequenciais simples, que revelam o volume de vendas para a concorrência e permitem enumeração. O Snowflake resolve: 64 bits, ordenável por tempo, gerado localmente sem coordenação e não denuncia o volume diretamente. O machine ID viria de um lease no etcd.</p>
+<p class="i">E se dois pedidos forem criados no mesmo milissegundo na mesma máquina?</p>
+<p class="c">A sequência de 12 bits cobre 4096 por ms por máquina. Se esgotar, o gerador espera o próximo ms. A 2 mil/s no total isso nunca acontece.</p>
+<p class="i">E se o NTP atrasar o relógio de uma máquina em 50 ms?</p>
+<p class="c">O gerador detecta que <code>agora &lt; último timestamp</code>. Para atrasos pequenos, eu esperaria esses 50 ms; para grandes, retornaria erro, tiraria a instância do pool e alertaria. Também configuraria o NTP para "slew" (ajuste gradual) em vez de "step".</p>
+<p class="i">Por que não UUID?</p>
+<p class="c">Funcionaria, mas 128 bits é ruim para um número que aparece em nota fiscal e atendimento, e o UUIDv4 fragmenta o índice primário. Se o requisito fosse "sem nenhuma infraestrutura", eu usaria UUIDv7.</p>
+</div>
+
+<h2 id="quiz">Quiz</h2>
+<div class="quiz" data-answer="1"><div class="q">Com 12 bits de sequência, quantos IDs uma máquina gera por milissegundo?</div>
+<button class="opt">1024</button><button class="opt">4096</button><button class="opt">12</button><button class="opt">65536</button>
+<div class="why">2<sup>12</sup> = 4096.</div></div>
+<div class="quiz" data-answer="3"><div class="q">Por que o timestamp fica nos bits mais significativos?</div>
+<button class="opt">Para economizar espaço</button><button class="opt">Por segurança</button><button class="opt">Por exigência do Go</button><button class="opt">Para que ordenar os IDs numericamente seja ordenar por tempo</button>
+<div class="why">Os bits mais altos dominam a comparação numérica.</div></div>
+<div class="quiz" data-answer="0"><div class="q">Principal desvantagem do ticket server?</div>
+<button class="opt">Ponto único de falha</button><button class="opt">IDs de 128 bits</button><button class="opt">IDs não numéricos</button><button class="opt">Colisões frequentes</button>
+<div class="why">Um banco central; com vários, é preciso sincronizá-los.</div></div>
+
+<h2 id="recursos">Vídeos e leituras</h2>
+<ul class="links">
+<li class="read"><a href="https://github.com/twitter-archive/snowflake/tree/snowflake-2010" target="_blank" rel="noopener">Twitter Snowflake (código original, 2010)</a></li>
+<li class="read"><a href="https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c" target="_blank" rel="noopener">Instagram: Sharding &amp; IDs at Instagram</a></li>
+<li class="read"><a href="https://code.flickr.net/2010/02/08/ticket-servers-distributed-unique-primary-keys-on-the-cheap/" target="_blank" rel="noopener">Flickr: Ticket Servers</a></li>
+<li class="read"><a href="https://www.rfc-editor.org/rfc/rfc9562" target="_blank" rel="noopener">RFC 9562: UUIDv7</a></li>
+<li class="video"><a href="https://www.youtube.com/results?search_query=design+unique+id+generator+distributed+system+snowflake" target="_blank" rel="noopener">Vídeos: unique ID generator</a></li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>

@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Sistema de notificações — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Capítulo 10 · Estudo de caso</span>
+<h1>Projete um sistema de notificações</h1>
+<p class="lead">Push mobile, SMS e e-mail para milhões de usuários: confiável (sem perder nada), sem duplicar, respeitando preferências e limites, e desacoplado de provedores terceiros instáveis.</p>
+
+<div class="objectives"><h4>Ao final você saberá:</h4><ul>
+<li>Explicar como funcionam APNs, FCM, provedores de SMS e de e-mail.</li>
+<li>Desacoplar o sistema com filas por canal e workers.</li>
+<li>Garantir entrega (at-least-once) sem duplicar (idempotência).</li>
+<li>Adicionar templates, preferências, rate limiting, retries e monitoramento.</li>
+</ul></div>
+
+<h2 id="tipos">Tipos de notificação</h2>
+<div class="table-wrap"><table>
+<tr><th>Tipo</th><th>Fluxo</th><th>O que você precisa</th></tr>
+<tr><td>iOS push</td><td>Provider (você) → <strong>APNs</strong> (Apple) → iPhone</td><td>Device token + payload JSON</td></tr>
+<tr><td>Android push</td><td>Provider → <strong>FCM</strong> (Firebase) → Android</td><td>Registration token</td></tr>
+<tr><td>SMS</td><td>Provider → Twilio, Nexmo, AWS SNS → operadora</td><td>Telefone; custo por mensagem</td></tr>
+<tr><td>E-mail</td><td>Provider → SendGrid, Mailchimp, SES</td><td>Endereço; reputação do domínio (SPF/DKIM)</td></tr>
+</table></div>
+
+<h2 id="requisitos">Requisitos</h2>
+<div class="dialog">
+<p class="c">Quais tipos?</p><p class="i">Push, SMS e e-mail.</p>
+<p class="c">Tempo real?</p><p class="i">Soft real-time: o mais rápido possível, mas pode haver um pequeno atraso sob carga.</p>
+<p class="c">Dispositivos?</p><p class="i">iOS, Android, laptop/desktop.</p>
+<p class="c">Quem dispara?</p><p class="i">Apps clientes e também agendamentos no servidor.</p>
+<p class="c">Usuário pode desativar?</p><p class="i">Sim, opt-out por canal.</p>
+<p class="c">Volume?</p><p class="i">10 milhões de push, 1 milhão de SMS e 5 milhões de e-mails por dia.</p>
+</div>
+
+<h2 id="contatos">Coletando informações de contato</h2>
+<p>Ao instalar o app ou se cadastrar, o servidor grava os device tokens, o telefone e o e-mail. Um usuário pode ter <strong>vários dispositivos</strong>.</p>
+<pre><code class="language-sql">CREATE TABLE users  (user_id bigint PRIMARY KEY, email text, country_code int, phone text, created_at timestamptz);
+CREATE TABLE devices(id bigint PRIMARY KEY, user_id bigint REFERENCES users, device_token text, platform text, last_logged_in timestamptz);
+CREATE TABLE notification_settings(user_id bigint, channel text, opt_in boolean, PRIMARY KEY (user_id, channel));</code></pre>
+
+<h2 id="v1">Primeira versão (e seus problemas)</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  S1[Serviço 1] & S2[Serviço 2] & SN[Serviço N] --> NS[Servidor de notificação único]
+  NS --> APNS[APNs] & FCM[FCM] & SMS[SMS] & EM[E-mail]</pre></figure>
+<ul>
+<li><strong>SPOF:</strong> um servidor só.</li>
+<li><strong>Difícil de escalar:</strong> tudo (bancos, cache, envio) num lugar só.</li>
+<li><strong>Gargalo de desempenho:</strong> montar HTML e esperar respostas de terceiros é lento; um pico derruba o sistema.</li>
+</ul>
+
+<h2 id="v2">Design melhorado</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  S[Serviços: pedidos, marketing, cron] --> LB[LB] --> NS[Servidores de notificação: auth, validação, rate limit]
+  NS <--> C[(Cache: usuários, devices, templates, settings)]
+  NS <--> DB[(Banco)]
+  NS --> QI[[Fila iOS]] --> WI[Workers iOS] --> APNS[APNs]
+  NS --> QA[[Fila Android]] --> WA[Workers Android] --> FCM[FCM]
+  NS --> QS[[Fila SMS]] --> WS[Workers SMS] --> TW[Twilio]
+  NS --> QE[[Fila e-mail]] --> WE[Workers e-mail] --> SG[SendGrid]
+  WI & WA & WS & WE --> LOG[(Log de notificações)]
+  WI -. falha .-> QI</pre></figure>
+<ol>
+<li>Um serviço chama a API do servidor de notificação.</li>
+<li>O servidor valida, busca dados do usuário (cache/banco), checa preferências e monta o evento a partir de um template.</li>
+<li>O evento vai para a <strong>fila do canal</strong>. Filas separadas isolam falhas: se o provedor de SMS cair, push continua.</li>
+<li>Workers consomem e chamam o provedor.</li>
+<li>O resultado é registrado no log; falhas voltam para a fila com retry.</li>
+</ol>
+<pre><code class="language-http">POST /v1/notifications
+{
+  "notification_id": "6f1c…",          ← chave de idempotência gerada pelo chamador
+  "to": { "user_id": 123456 },
+  "channel": ["push", "email"],
+  "template": "order_shipped",
+  "params": { "order": "A-998", "eta": "2026-11-20" },
+  "priority": "high"
+}</code></pre>
+
+<h2 id="confiabilidade">Deep dive: confiabilidade</h2>
+<h3>Como não perder notificações?</h3>
+<p>Persistir antes de confirmar: a notificação é gravada no log/banco e na fila durável. O worker só faz <em>ack</em> na fila depois de enviar com sucesso; se o worker morrer no meio, a mensagem é reentregue (<strong>at-least-once</strong>).</p>
+<h3>Exatamente uma vez?</h3>
+<p>Não dá para garantir com provedores externos (o APNs pode ter entregado e a resposta se perdido). Mas dá para reduzir drasticamente as duplicatas com <strong>dedup pelo notification_id</strong>: antes de enviar, checa se o ID já foi enviado (Redis <code>SET id NX EX 86400</code> ou uma tabela com chave única).</p>
+<div class="code-title">go/notification/worker.go: idempotência, retry com backoff exponencial + jitter, DLQ</div>
+<pre><code class="language-go" data-src="go/notification/worker.go">// Package notification mostra o núcleo confiável de um worker de notificações:
+//
+//   - idempotência: o mesmo evento (notification_id) nunca é enviado duas vezes,
+//     mesmo que a fila entregue a mensagem de novo (at-least-once);
+//   - retry com exponential backoff + jitter para falhas transitórias do provedor
+//     (APNs, FCM, Twilio, SendGrid);
+//   - dead-letter: depois de N tentativas a mensagem vai para análise manual.
+package notification
+
+import (
+	"context"
+	"errors"
+	"math/rand/v2"
+	"sync"
+	"time"
+)
+
+type Message struct {
+	ID      string // notification_id gerado na origem — chave de idempotência
+	UserID  string
+	Channel string // "push", "sms", "email"
+	Body    string
+}
+
+// Provider é o serviço terceiro que efetivamente entrega.
+type Provider interface {
+	Send(ctx context.Context, m Message) error
+}
+
+// ErrPermanent indica que não adianta tentar de novo (token de device inválido, e-mail inexistente).
+var ErrPermanent = errors.New("falha permanente")
+
+type Worker struct {
+	Provider    Provider
+	MaxAttempts int
+	BaseDelay   time.Duration
+	Sleep       func(time.Duration) // injetável nos testes
+
+	mu         sync.Mutex
+	sent       map[string]bool // em produção: Redis SETNX com TTL ou tabela com unique key
+	DeadLetter []Message
+}
+
+func (w *Worker) Handle(ctx context.Context, m Message) error {
+	w.mu.Lock()
+	if w.sent == nil {
+		w.sent = map[string]bool{}
+	}
+	if w.sent[m.ID] {
+		w.mu.Unlock()
+		return nil // duplicata: já entregue, ack e segue
+	}
+	w.mu.Unlock()
+
+	var err error
+	for attempt := 0; attempt &lt; w.MaxAttempts; attempt++ {
+		if err = w.Provider.Send(ctx, m); err == nil {
+			w.mu.Lock()
+			w.sent[m.ID] = true
+			w.mu.Unlock()
+			return nil
+		}
+		if errors.Is(err, ErrPermanent) {
+			break
+		}
+		// backoff: base·2^tentativa + jitter (evita "thundering herd" de retries sincronizados)
+		backoff := w.BaseDelay &lt;&lt; attempt
+		jitter := time.Duration(rand.Int64N(int64(w.BaseDelay) + 1))
+		w.Sleep(backoff + jitter)
+	}
+	w.mu.Lock()
+	w.DeadLetter = append(w.DeadLetter, m)
+	w.mu.Unlock()
+	return err
+}</code></pre>
+<h3>Mecanismo de retry</h3>
+<ul>
+<li>Falhas transitórias (timeout, 5xx, 429 do provedor): retry com <strong>backoff exponencial + jitter</strong>.</li>
+<li>Falhas permanentes (token inválido, e-mail inexistente): não repetir; marcar o device como inválido.</li>
+<li>Após N tentativas: <strong>dead-letter queue</strong> e alerta.</li>
+</ul>
+
+<h2 id="componentes-extras">Componentes adicionais</h2>
+<ul>
+<li><strong>Templates:</strong> formatos pré-definidos com parâmetros; consistência, menos erros e permitem A/B test e localização.</li>
+<li><strong>Configurações do usuário:</strong> checar o opt-in por canal antes de enfileirar.</li>
+<li><strong>Rate limiting por usuário:</strong> excesso de notificações leva o usuário a desativá-las. Por exemplo, no máximo 3 de marketing por dia.</li>
+<li><strong>Horário silencioso / fuso:</strong> agendar marketing para o horário local.</li>
+<li><strong>Prioridade:</strong> filas separadas para transacionais (código 2FA, "pedido saiu") e marketing, para que uma campanha de 10 milhões de e-mails não atrase o código de login.</li>
+<li><strong>Segurança:</strong> só serviços autenticados (appKey/appSecret ou mTLS) podem enviar.</li>
+<li><strong>Monitoramento:</strong> tamanho das filas (se cresce, adicione workers), taxa de erro por provedor.</li>
+<li><strong>Tracking de eventos:</strong> aberto, clicado, entregue; vai para analytics.</li>
+<li><strong>Fallback de provedor:</strong> dois provedores de SMS; se um falha, o circuit breaker troca para o outro.</li>
+</ul>
+<figure class="mermaid-wrap"><pre class="mermaid">stateDiagram-v2
+  [*] --> start
+  start --> pending: enfileirada
+  pending --> sent: provedor aceitou
+  pending --> error: falha
+  error --> pending: retry
+  error --> dead_letter: excedeu tentativas
+  sent --> delivered
+  delivered --> clicked
+  sent --> unsubscribed</pre>
+<figcaption>Ciclo de vida de uma notificação, útil para tracking e analytics.</figcaption></figure>
+
+<h2 id="simulacao">Simulação de entrevista</h2>
+<div class="dialog">
+<p class="i">O marketing quer mandar uma campanha para 50 milhões de usuários às 9h. Ao mesmo tempo, códigos 2FA precisam chegar em segundos. Como seu sistema lida com isso?</p>
+<p class="c">Separo por prioridade desde a entrada: filas distintas para transacional e para bulk, com pools de workers distintos. O 2FA nunca fica atrás da campanha. Também respeito os rate limits dos provedores: APNs e FCM aceitam muito, mas SMS e e-mail têm cotas, e o envio da campanha é controlado (throttled) para não esgotar a cota que o transacional precisa.</p>
+<p class="i">E como você gera 50 milhões de mensagens sem travar o serviço?</p>
+<p class="c">A campanha não passa pela API síncrona. Um job de campanha pagina a audiência (segmento pré-computado) e publica em lotes na fila bulk; workers expandem para cada device do usuário, aplicam preferências e o limite de frequência, e enviam. Se quisermos "às 9h no fuso de cada usuário", o job agenda os lotes por fuso.</p>
+<p class="i">Um worker caiu depois de enviar, mas antes do ack. O que acontece?</p>
+<p class="c">A fila reentrega e outro worker pega. Antes de enviar, ele checa o <code>notification_id</code> no store de dedup; como foi gravado após o envio, a segunda tentativa é descartada. Se o crash for exatamente entre o envio e a gravação do dedup, a duplicata é possível, e isso é aceitável para push: garantimos "pelo menos uma vez, quase sempre exatamente uma".</p>
+<p class="i">Como saber se está funcionando?</p>
+<p class="c">Métricas por canal: profundidade e idade da mensagem mais antiga em cada fila, latência de envio, taxa de erro por provedor e por código, tamanho da DLQ. Alertas na idade da fila transacional. E tracking de entrega e abertura para o produto.</p>
+</div>
+
+<h2 id="quiz">Quiz</h2>
+<div class="quiz" data-answer="2"><div class="q">Por que filas separadas por canal?</div>
+<button class="opt">Para economizar memória</button><button class="opt">Exigência do APNs</button><button class="opt">Isolar falhas e escalar cada canal independentemente</button><button class="opt">Para garantir ordem global</button>
+<div class="why">Se o SMS cair, o push não é afetado; cada fila escala seus workers.</div></div>
+<div class="quiz" data-answer="0"><div class="q">Como evitar enviar a mesma notificação duas vezes num sistema at-least-once?</div>
+<button class="opt">Dedup por notification_id antes de enviar</button><button class="opt">Desligar retries</button><button class="opt">Usar UDP</button><button class="opt">Usar uma fila FIFO</button>
+<div class="why">Idempotência no consumidor.</div></div>
+<div class="quiz" data-answer="3"><div class="q">O APNs respondeu "token inválido". O que fazer?</div>
+<button class="opt">Retry com backoff</button><button class="opt">Mandar para a DLQ e repetir amanhã</button><button class="opt">Trocar para SMS</button><button class="opt">Não repetir; marcar o device token como inválido</button>
+<div class="why">É falha permanente: repetir só desperdiça recursos.</div></div>
+
+<h2 id="recursos">Vídeos e leituras</h2>
+<ul class="links">
+<li class="read"><a href="https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns" target="_blank" rel="noopener">Apple: Sending notification requests to APNs</a></li>
+<li class="read"><a href="https://firebase.google.com/docs/cloud-messaging" target="_blank" rel="noopener">Firebase Cloud Messaging</a></li>
+<li class="read"><a href="https://aws.amazon.com/builders-library/avoiding-insurmountable-queue-backlogs/" target="_blank" rel="noopener">AWS: Avoiding insurmountable queue backlogs</a></li>
+<li class="video"><a href="https://www.youtube.com/results?search_query=design+notification+system+system+design+interview" target="_blank" rel="noopener">Vídeos: Design a notification system</a></li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>

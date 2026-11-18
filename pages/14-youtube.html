@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · YouTube — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Capítulo 14 · Estudo de caso</span>
+<h1>Projete o YouTube</h1>
+<p class="lead">Upload, processamento e streaming de vídeo em escala global. O tema central é <strong>custo</strong>: CDN e transcodificação são as maiores contas, e um bom design tira proveito da distribuição de popularidade.</p>
+
+<div class="objectives"><h4>Ao final você saberá:</h4><ul>
+<li>Desenhar os fluxos de upload e de streaming.</li>
+<li>Explicar transcodificação, bitrate adaptativo e protocolos de streaming.</li>
+<li>Modelar o pipeline de processamento como um DAG.</li>
+<li>Otimizar velocidade, segurança e custo de CDN.</li>
+</ul></div>
+
+<h2 id="requisitos">Requisitos</h2>
+<div class="dialog">
+<p class="c">Funcionalidades mais importantes?</p><p class="i">Upload e assistir vídeos.</p>
+<p class="c">Clientes?</p><p class="i">Mobile, web e smart TV.</p>
+<p class="c">DAU?</p><p class="i">5 milhões.</p>
+<p class="c">Tempo médio diário?</p><p class="i">30 minutos.</p>
+<p class="c">Internacional?</p><p class="i">Sim, uma boa parte dos usuários.</p>
+<p class="c">Resoluções?</p><p class="i">A maioria das resoluções e formatos.</p>
+<p class="c">Criptografia?</p><p class="i">Sim.</p>
+<p class="c">Tamanho máximo?</p><p class="i">1 GB (vídeos curtos e médios).</p>
+<p class="c">Posso usar cloud (CDN, blob storage)?</p><p class="i">Sim, é uma ótima pergunta.</p>
+</div>
+<p>Não funcionais: upload rápido, streaming suave, possibilidade de mudar a qualidade, custo baixo de infraestrutura, alta disponibilidade e confiabilidade.</p>
+
+<h2 id="estimativas">Estimativas</h2>
+<ul>
+<li>5 M DAU, 5 vídeos assistidos por dia; <strong>10%</strong> dos usuários fazem upload de 1 vídeo por dia.</li>
+<li>Vídeo médio de 300 MB: 5 M × 10% × 300 MB = <strong>150 TB/dia</strong> de armazenamento novo.</li>
+<li>Custo de CDN (CloudFront, ~US$ 0,02/GB nos EUA): 5 M × 5 vídeos × 0,3 GB × US$ 0,02 = <strong>US$ 150 mil por dia</strong>. Esse número guia o deep dive de custo.</li>
+</ul>
+
+<h2 id="alto-nivel">Alto nível</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  C[Cliente: mobile, web, TV] -->|streaming| CDN[CDN]
+  C -->|"tudo que não é streaming: upload de metadados, busca, recomendações"| API[API servers]
+  API --> META[(Metadata DB + cache)]
+  C -->|upload do arquivo| OS[(Original storage: blob)]
+  OS --> TS[Transcoding servers] --> TST[(Transcoded storage)]
+  TST --> CDN
+  TS --> CQ[[Completion queue]] --> CH[Completion handler] --> META</pre></figure>
+
+<h2 id="upload">Fluxo de upload</h2>
+<p>Dois processos em paralelo:</p>
+<ol>
+<li><strong>Upload do arquivo:</strong> para o original storage (blob), via presigned URL; depois, transcodificação; os vídeos transcodificados vão para storage e CDN; uma mensagem na completion queue leva o completion handler a atualizar os metadados (status "pronto", URLs).</li>
+<li><strong>Metadados:</strong> enquanto o arquivo sobe, o cliente envia título, descrição, tags etc. aos API servers, que gravam no metadata DB e no cache.</li>
+</ol>
+
+<h2 id="streaming">Fluxo de streaming</h2>
+<p>O vídeo é <em>transmitido</em> em pedaços, não baixado inteiro antes. O player toca enquanto baixa os próximos segmentos, direto da CDN mais próxima.</p>
+<div class="table-wrap"><table>
+<tr><th>Protocolo</th><th>Nota</th></tr>
+<tr><td>MPEG-DASH</td><td>Padrão aberto</td></tr>
+<tr><td>Apple HLS</td><td>Obrigatório no ecossistema Apple; muito usado</td></tr>
+<tr><td>Microsoft Smooth Streaming, Adobe HDS</td><td>Legados</td></tr>
+</table></div>
+<p><strong>Adaptive bitrate (ABR):</strong> cada vídeo é codificado em várias resoluções/bitrates e dividido em segmentos de poucos segundos; um <em>manifest</em> lista as opções. O player mede a banda e troca de qualidade entre segmentos. É por isso que o vídeo fica "borrado" por um instante quando a rede piora, mas não para.</p>
+
+<h2 id="transcoding">Deep dive: transcodificação</h2>
+<p><strong>Por quê?</strong> (1) o vídeo cru é enorme (1 hora de HD a 60 fps pode ter centenas de GB); (2) dispositivos e navegadores suportam formatos diferentes; (3) o ABR exige várias qualidades; (4) redes móveis precisam de bitrates baixos.</p>
+<p><strong>Formato = container + codec:</strong> o container (.mp4, .webm, .mov) é a "caixa" com vídeo, áudio e metadados; o codec (H.264, VP9, HEVC, AV1) é o algoritmo de compressão.</p>
+
+<h3>O pipeline como DAG</h3>
+<p>Criadores pedem coisas diferentes (marca d'água, miniaturas customizadas, alta qualidade). Para paralelismo e flexibilidade, o pipeline é um <strong>grafo acíclico direcionado (DAG)</strong> de tarefas, como no sistema de processamento de vídeo do Facebook.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  O[Vídeo original] --> SPLIT[Split: vídeo, áudio, metadados]
+  SPLIT --> V[Vídeo]
+  SPLIT --> A[Áudio]
+  SPLIT --> M[Metadados]
+  V --> INSP[Inspeção: qualidade, corrupção]
+  V --> ENC[Encoding: 360p, 720p, 1080p, 4K]
+  V --> TH[Thumbnails]
+  V --> WM[Watermark]
+  A --> AENC[Audio encoding]
+  ENC & AENC & TH & WM & INSP --> ASM[Assemble + manifest]</pre></figure>
+
+<h3>Arquitetura de transcodificação</h3>
+<div class="table-wrap"><table>
+<tr><th>Componente</th><th>Papel</th></tr>
+<tr><td>Preprocessor</td><td>Divide o vídeo em <strong>GOPs</strong> (Group of Pictures: blocos de poucos segundos que tocam independentemente), gera o DAG a partir de arquivos de configuração e <strong>cacheia</strong> segmentos e o DAG para retries</td></tr>
+<tr><td>DAG scheduler</td><td>Divide o DAG em estágios e coloca as tarefas na fila</td></tr>
+<tr><td>Resource manager</td><td>Fila de tarefas (por prioridade), fila de workers (por utilização), fila de execução. Escolhe a melhor combinação tarefa ↔ worker</td></tr>
+<tr><td>Task workers</td><td>Executam as tarefas (encoders, thumbnailers, watermark…), escalam horizontalmente</td></tr>
+<tr><td>Temporary storage</td><td>Metadados em memória; vídeo e áudio em blob</td></tr>
+<tr><td>Encoded video</td><td>Saída final: por exemplo, <code>funny_720p.mp4</code></td></tr>
+</table></div>
+<p>Na prática você pode citar <strong>Temporal / Step Functions</strong> para orquestrar o DAG, ou filas + workers em Kubernetes, com instâncias spot para baratear.</p>
+
+<h2 id="otimizacoes">Otimizações</h2>
+<h3>Velocidade</h3>
+<ul>
+<li><strong>Upload paralelo:</strong> o cliente divide o vídeo em GOPs ou chunks e sobe em paralelo (S3 multipart), com retomada em caso de falha.</li>
+<li><strong>Centros de upload próximos</strong> do usuário (a CDN como ponto de entrada de upload).</li>
+<li><strong>Paralelismo em todo lugar:</strong> filas entre os estágios (download → encoding → upload), para que cada estágio trabalhe independentemente sem esperar o anterior.</li>
+</ul>
+<h3>Segurança</h3>
+<ul>
+<li><strong>Presigned URLs</strong> para upload: só usuários autorizados enviam ao local correto.</li>
+<li><strong>Proteção de conteúdo:</strong> DRM (FairPlay, Widevine, PlayReady), criptografia AES do segmento, marca d'água visual.</li>
+</ul>
+<h3>Custo: a otimização mais importante</h3>
+<p>A popularidade segue uma <strong>cauda longa</strong>: poucos vídeos concentram a maior parte das visualizações.</p>
+<ol>
+<li>Servir pela CDN só os vídeos populares; os outros, por servidores próprios de alta capacidade.</li>
+<li>Para conteúdo pouco popular, não guardar todas as versões codificadas: <strong>transcodificar sob demanda</strong> ou só algumas resoluções.</li>
+<li>Distribuir por região: vídeos populares só numa região não precisam estar em CDNs do mundo inteiro.</li>
+<li>Construir a própria CDN e fazer acordos com ISPs (o Netflix Open Connect põe caches dentro dos provedores).</li>
+</ol>
+
+<h2 id="dados">Metadados e escala</h2>
+<ul>
+<li><strong>Metadados de vídeo</strong> (id, título, dono, status, URLs): relacional (o YouTube usa MySQL sharded com <strong>Vitess</strong>), réplicas de leitura e cache.</li>
+<li><strong>Contadores de views:</strong> alta escrita, então agregue em memória/stream e grave em lote; números aproximados são aceitáveis.</li>
+<li><strong>Comentários, likes:</strong> wide-column ou relacional sharded por video_id.</li>
+</ul>
+
+<h2 id="falhas">Tratamento de erros</h2>
+<div class="table-wrap"><table>
+<tr><th>Erro</th><th>Tratamento</th></tr>
+<tr><td>Upload falha</td><td>Retry por chunk (multipart retomável)</td></tr>
+<tr><td>Falha ao dividir o vídeo</td><td>Clientes antigos não dividem: o servidor divide</td></tr>
+<tr><td>Erro de transcodificação</td><td>Retry da tarefa; depois de N vezes, marcar como falho</td></tr>
+<tr><td>Preprocessor cai</td><td>Regenerar o DAG</td></tr>
+<tr><td>DAG scheduler cai</td><td>Reagendar a partir do estado salvo</td></tr>
+<tr><td>Resource manager / worker cai</td><td>Réplica assume; tarefa vai para outro worker</td></tr>
+<tr><td>API server cai</td><td>Stateless: o LB envia para outro</td></tr>
+<tr><td>Metadata cache/DB cai</td><td>Réplicas; promover nova primária</td></tr>
+</table></div>
+<p><strong>Recuperáveis</strong> (falha temporária num segmento): retry. <strong>Não recuperáveis</strong> (formato inválido): parar e informar o usuário.</p>
+
+<h2 id="simulacao">Simulação de entrevista</h2>
+<div class="dialog">
+<p class="i">Nossa conta de CDN está US$ 4 milhões por mês. Como reduzir sem piorar a experiência?</p>
+<p class="c">Primeiro, olharia a distribuição: aposto que os 10% de vídeos mais vistos respondem por 80–90% dos bytes servidos. Esses ficam na CDN, onde o hit rate é alto. A cauda longa, vídeos com poucas views, eu tiraria da CDN comercial e serviria de servidores de origem próprios em poucas regiões; a latência inicial é um pouco maior, mas são poucas requisições.</p>
+<p class="i">E o armazenamento? Guardamos 8 resoluções de cada vídeo.</p>
+<p class="c">Para a cauda longa, eu guardaria 2 ou 3 resoluções populares e geraria as outras sob demanda, cacheando o resultado se houver procura. Também mudaria vídeos antigos e pouco vistos para uma classe de storage mais fria. E consideraria codecs mais eficientes (AV1/VP9) para os vídeos mais populares: o custo de encode é maior, mas cada byte economizado é multiplicado por milhões de views.</p>
+<p class="i">Faria sentido construir a própria CDN?</p>
+<p class="c">Na nossa escala, talvez. O padrão da indústria (Netflix Open Connect, Google Global Cache) é colocar appliances de cache dentro dos ISPs, o que reduz o custo de trânsito para os dois lados. É um investimento grande, então eu começaria com a migração da cauda longa e só depois avaliaria, com os números, os acordos com os maiores ISPs.</p>
+</div>
+
+<h2 id="quiz">Quiz</h2>
+<div class="quiz" data-answer="1"><div class="q">O que é adaptive bitrate streaming?</div>
+<button class="opt">Comprimir o vídeo no cliente</button><button class="opt">Vídeo em várias qualidades e segmentos; o player troca de qualidade conforme a banda</button><button class="opt">Usar WebSocket para vídeo</button><button class="opt">Baixar o vídeo inteiro antes de tocar</button>
+<div class="why">HLS/DASH com manifest e segmentos de poucos segundos.</div></div>
+<div class="quiz" data-answer="2"><div class="q">Por que modelar a transcodificação como DAG?</div>
+<button class="opt">Para ordenar vídeos por popularidade</button><button class="opt">Exigência do H.264</button><button class="opt">Paralelizar tarefas independentes e permitir pipelines configuráveis</button><button class="opt">Para economizar CDN</button>
+<div class="why">Áudio, thumbnails e várias resoluções rodam em paralelo; cada criador pode ter um pipeline diferente.</div></div>
+<div class="quiz" data-answer="0"><div class="q">Maior alavanca de redução de custo?</div>
+<button class="opt">Servir pela CDN só o conteúdo popular e tratar a cauda longa à parte</button><button class="opt">Remover a compressão</button><button class="opt">Usar só 4K</button><button class="opt">Guardar vídeos no banco relacional</button>
+<div class="why">A popularidade é muito concentrada.</div></div>
+
+<h2 id="recursos">Vídeos e leituras</h2>
+<ul class="links">
+<li class="read"><a href="https://netflixtechblog.com/" target="_blank" rel="noopener">Netflix Tech Blog</a><small>Encoding, Open Connect, microsserviços.</small></li>
+<li class="read"><a href="https://openconnect.netflix.com/" target="_blank" rel="noopener">Netflix Open Connect</a></li>
+<li class="read"><a href="https://engineering.fb.com/2015/03/02/video-engineering/sve-distributed-video-processing-at-facebook-scale/" target="_blank" rel="noopener">SVE: Distributed video processing at Facebook scale</a></li>
+<li class="read"><a href="https://vitess.io/" target="_blank" rel="noopener">Vitess</a><small>Sharding de MySQL criado no YouTube.</small></li>
+<li class="read"><a href="https://www.hellointerview.com/learn/system-design/problem-breakdowns/youtube" target="_blank" rel="noopener">Hello Interview: YouTube</a></li>
+<li class="video"><a href="https://www.youtube.com/results?search_query=design+youtube+system+design+interview" target="_blank" rel="noopener">Vídeos: Design YouTube / Netflix</a></li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>

@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guia e plano de estudos — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Comece aqui</span>
+<h1>Guia e plano de estudos</h1>
+<p class="lead">O que a entrevista de system design avalia, como estudar para ela e um plano de 2, 4 ou 8 semanas.</p>
+
+<h2 id="o-que-e">O que é a entrevista de system design</h2>
+<p>Você recebe um problema propositalmente vago, como "projete o Twitter" ou "projete um encurtador de URL", e tem de 45 a 60 minutos para chegar a uma arquitetura conversando com a pessoa entrevistadora. <strong>Não existe resposta certa única.</strong> A entrevista simula duas pessoas engenheiras resolvendo juntas um problema ambíguo.</p>
+<p>O que está sendo avaliado:</p>
+<div class="table-wrap"><table>
+<tr><th>Sinal</th><th>Como aparece</th><th>Como demonstrar</th></tr>
+<tr><td><strong>Lidar com ambiguidade</strong></td><td>O enunciado tem 5 palavras de propósito.</td><td>Faça perguntas antes de desenhar. Escreva requisitos funcionais e não funcionais.</td></tr>
+<tr><td><strong>Visão de arquitetura</strong></td><td>Você consegue desenhar um sistema completo e funcional?</td><td>Um diagrama de alto nível que atenda a <em>todos</em> os requisitos antes de otimizar.</td></tr>
+<tr><td><strong>Trade-offs</strong></td><td>Cada escolha tem um custo.</td><td>"Escolhi X em vez de Y porque…, o custo é…, mitigamos com…"</td></tr>
+<tr><td><strong>Profundidade técnica</strong></td><td>Aprofundar 1 ou 2 componentes.</td><td>Detalhes reais: esquema, algoritmo, consistência, falhas, números.</td></tr>
+<tr><td><strong>Comunicação e colaboração</strong></td><td>A pessoa entrevistadora dá dicas.</td><td>Pense em voz alta, ouça as dicas, confirme antes de seguir.</td></tr>
+<tr><td><strong>Pragmatismo</strong></td><td>Over-engineering é sinal ruim.</td><td>Comece simples; escale só onde os números pedem.</td></tr>
+</table></div>
+
+<div class="box interview">
+  <strong class="t">Por nível</strong>
+  <ul>
+    <li><strong>Pleno:</strong> chegar a um design funcional, com componentes corretos e alguns trade-offs.</li>
+    <li><strong>Sênior:</strong> conduzir a conversa, identificar sozinha os gargalos e aprofundar pelo menos 2 áreas com detalhes (modelo de dados, consistência, falhas).</li>
+    <li><strong>Staff+:</strong> discutir evolução, operação (observabilidade, deploy, custo), impacto organizacional e alternativas descartadas.</li>
+  </ul>
+</div>
+
+<h2 id="como-estudar">Como estudar com este site</h2>
+<ol>
+  <li><strong>Leia os fundamentos (capítulos 1–3)</strong> e as páginas <a href="ferramentas.html">Qual ferramenta usar?</a> e <a href="distribuidos.html">Sistemas distribuídos</a>. Sem esse vocabulário, os estudos de caso parecem decoreba.</li>
+  <li><strong>Para cada estudo de caso:</strong> antes de ler, abra o <a href="simulacoes.html">simulador</a> e tente resolver sozinha por 30–45 min. <em>Depois</em> leia a página do caso e compare. É assim que se aprende de verdade.</li>
+  <li><strong>Leia o código Go</strong> e rode os testes. Implementar token bucket, consistent hashing e Snowflake fixa os conceitos e ainda prepara para perguntas de código.</li>
+  <li><strong>Faça os quizzes e <a href="exercicios.html">exercícios</a></strong>, sobretudo os de estimativa e de "qual ferramenta?". Eles treinam a velocidade de decisão.</li>
+  <li><strong>Simule em voz alta.</strong> Fale sozinha, grave, ou chame alguém para fazer o papel de entrevistador usando as perguntas do simulador. Comunicação é metade da nota.</li>
+  <li><strong>Revise com a <a href="cola.html">cola</a></strong> na véspera.</li>
+</ol>
+
+<div class="box tip">
+  <strong class="t">A técnica mais eficiente: explicar o porquê</strong>
+  Para cada componente que você desenhar, treine dizer em uma frase <em>por que ele está ali</em> e <em>o que aconteceria sem ele</em>. "Coloquei uma fila entre a API e os workers porque o envio de push é lento e pode falhar; sem ela, um pico de eventos derrubaria a API e perderíamos notificações."
+</div>
+
+<h2 id="plano">Planos de estudo</h2>
+<h3>Intensivo: 2 semanas (entrevista marcada)</h3>
+<div class="table-wrap"><table>
+<tr><th>Dia</th><th>Conteúdo</th><th>Prática</th></tr>
+<tr><td>1</td><td>Cap. 1 (escala) + Cap. 3 (framework)</td><td>Quiz das páginas</td></tr>
+<tr><td>2</td><td>Cap. 2 (estimativas) + Qual ferramenta usar?</td><td>10 exercícios de estimativa</td></tr>
+<tr><td>3</td><td>Sistemas distribuídos</td><td>Exercícios de conceitos</td></tr>
+<tr><td>4</td><td>Encurtador de URL + Gerador de IDs</td><td>Simulação: encurtador</td></tr>
+<tr><td>5</td><td>Rate limiter + Consistent hashing</td><td>Simulação: rate limiter</td></tr>
+<tr><td>6</td><td>Key-value store</td><td>Simulação: KV store</td></tr>
+<tr><td>7</td><td>News feed + Notificações</td><td>Simulação: news feed</td></tr>
+<tr><td>8</td><td>Chat</td><td>Simulação: chat</td></tr>
+<tr><td>9</td><td>YouTube + Google Drive</td><td>Simulação: YouTube</td></tr>
+<tr><td>10</td><td>Web crawler + Autocomplete</td><td>Simulação: autocomplete</td></tr>
+<tr><td>11</td><td>—</td><td>Simulações extras: Uber, Ticketmaster</td></tr>
+<tr><td>12</td><td>—</td><td>Simulações extras: pagamentos, leaderboard</td></tr>
+<tr><td>13</td><td>Revisar erros dos quizzes</td><td>1 simulação cronometrada em voz alta</td></tr>
+<tr><td>14</td><td>Cola</td><td>Descanso ativo: só revisão leve</td></tr>
+</table></div>
+
+<h3>Regular: 4 semanas (1–2 h/dia)</h3>
+<ul>
+  <li><strong>Semana 1:</strong> fundamentos (caps. 1–3), ferramentas, sistemas distribuídos e todos os exercícios de estimativa.</li>
+  <li><strong>Semana 2:</strong> caps. 4–8, sempre com a simulação <em>antes</em> da leitura, e o código Go de cada um.</li>
+  <li><strong>Semana 3:</strong> caps. 9–15, mais as 2 simulações mais difíceis.</li>
+  <li><strong>Semana 4:</strong> as 12 simulações extras (fora do livro), exercícios de trade-off e de design, e uma simulação por dia em voz alta.</li>
+</ul>
+
+<h3>Tranquilo: 8 semanas (aprendizado profundo)</h3>
+<p>Siga o plano de 4 semanas em dobro de tempo e acrescente: um capítulo do livro <em>Designing Data-Intensive Applications</em> por semana (veja <a href="recursos.html">Recursos</a>), um paper clássico a cada 2 semanas (Dynamo, Bigtable, Kafka) e implemente uma extensão em Go por semana (por exemplo, um rate limiter com Redis ou hinted handoff no KV store).</p>
+
+<h2 id="ambiente">Rodando o código Go</h2>
+<pre><code class="language-bash">git clone &lt;seu-repo&gt;/systemdesing
+cd systemdesing/go
+go test ./... -v          # roda todos os exemplos com explicações nos logs
+go test ./consistenthash -v -run Remapping</code></pre>
+<p>Requer Go 1.22+ (o código usa <code>min</code>/<code>max</code> nativos, generics e <code>math/rand/v2</code>).</p>
+
+<h2 id="sobre-o-livro">Sobre o livro-base</h2>
+<p>A sequência de tópicos segue o livro <em>System Design Interview – An Insider's Guide</em> (Volume 1), de Alex Xu. Os textos, exemplos, diagramas, código e exercícios deste site são originais e acrescentam muito material que não está no livro (guia de ferramentas, sistemas distribuídos, simulações extras). Recomendo ter o livro e também o <strong>Volume 2</strong> (proximidade, Google Maps, fila distribuída, métricas, pagamentos, bolsa de valores), cujos temas aparecem no simulador.</p>
+
+</article>
+</main>
+</body>
+</html>

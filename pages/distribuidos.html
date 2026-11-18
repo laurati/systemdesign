@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Conceitos de sistemas distribuídos — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Blocos de construção · Teoria</span>
+<h1>Conceitos de sistemas distribuídos</h1>
+<p class="lead">O vocabulário que separa uma resposta "ok" de uma resposta sênior: consistência, replicação, particionamento, consenso, idempotência e padrões de resiliência.</p>
+
+<h2 id="cap">Teorema CAP</h2>
+<p>Num sistema distribuído, quando há <strong>partição de rede</strong> (P), você precisa escolher entre:</p>
+<ul>
+<li><strong>Consistência (C):</strong> todo cliente vê o mesmo dado mais recente (linearizabilidade); para isso, alguns nós recusam requisições.</li>
+<li><strong>Disponibilidade (A):</strong> todo nó responde, mesmo que com dado possivelmente desatualizado.</li>
+</ul>
+<p>Partições <em>vão</em> acontecer, então na prática a escolha é <strong>CP ou AP</strong> durante uma partição.</p>
+<div class="table-wrap"><table>
+<tr><th>Escolha</th><th>Quando</th><th>Exemplos</th></tr>
+<tr><td><strong>CP</strong></td><td>Dado errado é pior que indisponível: saldo bancário, reserva de assento, estoque, locks</td><td>Spanner, etcd/ZooKeeper, HBase, Postgres com réplica síncrona, MongoDB (padrão)</td></tr>
+<tr><td><strong>AP</strong></td><td>Melhor responder algo do que nada: feed, curtidas, carrinho, catálogo, perfil</td><td>Cassandra, DynamoDB (padrão), Riak, CouchDB, DNS</td></tr>
+</table></div>
+<div class="box interview"><strong class="t">Na entrevista</strong>
+Não diga "vou usar CP" no abstrato. Diga por funcionalidade: "Para a reserva do assento preciso de consistência forte: dois usuários não podem pegar o mesmo lugar. Já a lista de eventos e as descrições podem ser eventualmente consistentes e servidas de cache." Sistemas reais misturam os dois.</div>
+
+<h3 id="pacelc">PACELC</h3>
+<p>Extensão do CAP: <strong>se</strong> houver Partição, escolha A ou C; <strong>senão</strong> (Else), escolha entre <strong>L</strong>atência e <strong>C</strong>onsistência. Mesmo sem falhas, consistência forte custa latência (esperar réplicas). DynamoDB e Cassandra são PA/EL; Spanner é PC/EC.</p>
+
+<h2 id="consistencia">Modelos de consistência</h2>
+<div class="table-wrap"><table>
+<tr><th>Modelo</th><th>Garantia</th><th>Exemplo de uso</th></tr>
+<tr><td><strong>Linearizável</strong> (forte)</td><td>Parece haver uma única cópia; toda leitura vê a última escrita confirmada</td><td>Locks, eleição de líder, saldo</td></tr>
+<tr><td><strong>Sequencial</strong></td><td>Todos veem as operações na mesma ordem (não necessariamente a do relógio real)</td><td>—</td></tr>
+<tr><td><strong>Causal</strong></td><td>Operações relacionadas causalmente aparecem na ordem certa (a resposta nunca antes da pergunta)</td><td>Comentários, chat</td></tr>
+<tr><td><strong>Read-your-writes</strong></td><td>Você sempre vê suas próprias escritas</td><td>Editar perfil e ver a mudança</td></tr>
+<tr><td><strong>Monotonic reads</strong></td><td>Você nunca "volta no tempo" entre leituras</td><td>Rolagem de feed</td></tr>
+<tr><td><strong>Eventual</strong></td><td>Sem novas escritas, as réplicas convergem em algum momento</td><td>Contadores de like, DNS, feed</td></tr>
+</table></div>
+
+<h2 id="replicacao">Replicação</h2>
+<div class="table-wrap"><table>
+<tr><th>Modelo</th><th>Como</th><th>Prós</th><th>Contras</th><th>Exemplos</th></tr>
+<tr><td><strong>Líder único</strong></td><td>Escritas no líder, que replica para os seguidores</td><td>Simples, sem conflitos</td><td>Escrita limitada a 1 nó; failover delicado</td><td>Postgres, MySQL, MongoDB</td></tr>
+<tr><td><strong>Multi-líder</strong></td><td>Um líder por região, que replicam entre si</td><td>Escrita local em cada região, tolera queda de uma região</td><td>Conflitos de escrita (exige resolução: LWW, CRDT)</td><td>Bancos multi-região, apps offline-first, Google Docs</td></tr>
+<tr><td><strong>Sem líder</strong> (leaderless)</td><td>Cliente/coordenador escreve em W de N réplicas, lê de R</td><td>Alta disponibilidade, sem failover</td><td>Consistência eventual, conflitos (vector clocks), reparo</td><td>Dynamo, Cassandra, Riak</td></tr>
+</table></div>
+<p><strong>Síncrona × assíncrona:</strong> síncrona garante que a réplica tem o dado (durabilidade e consistência), mas a escrita espera a réplica mais lenta. Assíncrona é rápida, mas o failover pode perder escritas. Meio-termo comum: <em>semissíncrona</em> (1 réplica síncrona, o resto assíncrono).</p>
+
+<h2 id="quorum">Quórum (N, W, R)</h2>
+<p><strong>N</strong> = número de réplicas, <strong>W</strong> = confirmações exigidas na escrita, <strong>R</strong> = respostas exigidas na leitura.</p>
+<ul>
+<li><strong>W + R &gt; N</strong>: os conjuntos de escrita e leitura se sobrepõem em pelo menos 1 nó, então a leitura vê a última escrita (consistência "forte" no sentido do quórum).</li>
+<li><strong>N=3, W=2, R=2:</strong> configuração típica; tolera 1 nó fora.</li>
+<li><strong>R=1, W=N:</strong> leitura rápida, escrita lenta e frágil.</li>
+<li><strong>W=1, R=N:</strong> escrita rápida.</li>
+<li><strong>W + R ≤ N:</strong> mais rápido e disponível, mas a leitura pode ser velha.</li>
+</ul>
+<p>Implementação em Go no <a href="06-key-value-store.html#quorum">capítulo 6</a>.</p>
+
+<h2 id="particionamento">Particionamento (sharding)</h2>
+<div class="table-wrap"><table>
+<tr><th>Estratégia</th><th>Como</th><th>Prós</th><th>Contras</th></tr>
+<tr><td><strong>Por faixa</strong> (range)</td><td>A–F no shard 1, G–M no 2… ou por data</td><td>Range scans eficientes</td><td>Hotspots (todo mundo escreve "hoje")</td></tr>
+<tr><td><strong>Por hash</strong></td><td><code>hash(key) % N</code></td><td>Distribuição uniforme</td><td>Range scans impossíveis; resharding move tudo</td></tr>
+<tr><td><strong>Consistent hashing</strong></td><td>Anel de hash com nós virtuais</td><td>Adicionar ou remover nó move ~1/N das chaves</td><td>Mais complexo; sem range scans</td></tr>
+<tr><td><strong>Diretório / lookup</strong></td><td>Serviço que mapeia chave → shard</td><td>Flexível (move tenants grandes)</td><td>O diretório vira dependência crítica</td></tr>
+</table></div>
+<p><strong>Hotspots</strong> (a "celebridade"): adicione um sufixo aleatório à chave (<code>post_123#0..9</code>) para espalhar escritas e agregue na leitura; cache; shard dedicado.</p>
+<p><strong>Índices secundários</strong> em dados particionados: <em>locais</em> (por shard: a leitura consulta todos os shards, scatter-gather) ou <em>globais</em> (particionados pelo termo: a escrita atualiza vários shards, geralmente de forma assíncrona).</p>
+
+<h2 id="consenso">Consenso e eleição de líder</h2>
+<p>Consenso = vários nós concordarem com um valor (quem é o líder, qual a próxima entrada do log) mesmo com falhas. <strong>Raft</strong> (etcd, Consul, CockroachDB, Kafka KRaft) e <strong>Paxos</strong> (Spanner, Chubby) toleram <em>f</em> falhas com 2<em>f</em>+1 nós: 3 nós toleram 1 falha, 5 toleram 2.</p>
+<p>Raft em 3 frases: (1) os nós elegem um líder por maioria de votos num <em>term</em>; (2) o líder recebe as escritas, anexa ao log e replica; uma entrada está <em>commitada</em> quando a maioria a tem; (3) se o líder some (sem heartbeat), um seguidor vira candidato e há nova eleição.</p>
+<div class="box tip"><strong class="t">Na entrevista</strong>
+Você quase nunca implementa consenso: você <em>usa</em> um sistema que o implementa. "Para eleger o líder do scheduler uso um lease no etcd" é a resposta certa.</div>
+<p><strong>Split brain e fencing tokens:</strong> um líder antigo, pausado por GC, pode acordar achando que ainda é líder. Cada lease vem com um número crescente (fencing token), e o storage rejeita escritas com token antigo.</p>
+
+<h2 id="tempo">Tempo e ordenação</h2>
+<ul>
+<li><strong>Relógios físicos não são confiáveis</strong> entre máquinas: o NTP tem erro de ms, os relógios podem voltar e há leap seconds. Last-write-wins por timestamp pode perder dados.</li>
+<li><strong>Relógio de Lamport:</strong> contador que dá uma ordem total consistente com a causalidade, mas não detecta concorrência.</li>
+<li><strong>Vector clocks:</strong> um contador por nó; detectam se duas versões são concorrentes (conflito). Veja o <a href="06-key-value-store.html#vector-clock">capítulo 6</a>.</li>
+<li><strong>TrueTime (Spanner):</strong> relógio com intervalo de incerteza (GPS + relógios atômicos); espera a incerteza passar para garantir a ordem.</li>
+<li><strong>Hybrid Logical Clocks:</strong> combinam tempo físico e contador lógico (CockroachDB).</li>
+</ul>
+
+<h2 id="entrega">Semânticas de entrega e idempotência</h2>
+<div class="table-wrap"><table>
+<tr><th>Semântica</th><th>O que significa</th><th>Como</th></tr>
+<tr><td>At-most-once</td><td>Pode perder, nunca duplica</td><td>Envia sem retry / ack antes de processar</td></tr>
+<tr><td>At-least-once</td><td>Nunca perde, pode duplicar</td><td>Retry até o ack / ack depois de processar. <strong>O padrão.</strong></td></tr>
+<tr><td>Exactly-once</td><td>Nem perde nem duplica</td><td>Na prática: <strong>at-least-once + consumidor idempotente</strong> (ou transações do Kafka dentro do próprio Kafka)</td></tr>
+</table></div>
+<p><strong>Idempotência:</strong> executar 2 vezes tem o mesmo efeito que executar 1. Técnicas:</p>
+<ul>
+<li><strong>Idempotency key</strong> enviada pelo cliente (<code>Idempotency-Key: uuid</code> no header, como a Stripe faz): o servidor guarda chave → resultado e devolve o mesmo resultado num retry.</li>
+<li><strong>Constraint UNIQUE</strong> no banco (event_id) e <code>INSERT … ON CONFLICT DO NOTHING</code>.</li>
+<li><strong>Operações naturalmente idempotentes:</strong> <code>SET status='PAGO'</code> em vez de <code>saldo = saldo - 10</code>.</li>
+<li><strong>Versão/ETag:</strong> <code>UPDATE … WHERE version = 7</code>.</li>
+</ul>
+<div class="code-title">go/notification/worker.go (trecho): dedupe por ID + retry com backoff</div>
+<pre><code class="language-go" data-src="go/notification/worker.go" data-lines="44-75">func (w *Worker) Handle(ctx context.Context, m Message) error {
+	w.mu.Lock()
+	if w.sent == nil {
+		w.sent = map[string]bool{}
+	}
+	if w.sent[m.ID] {
+		w.mu.Unlock()
+		return nil // duplicata: já entregue, ack e segue
+	}
+	w.mu.Unlock()
+
+	var err error
+	for attempt := 0; attempt &lt; w.MaxAttempts; attempt++ {
+		if err = w.Provider.Send(ctx, m); err == nil {
+			w.mu.Lock()
+			w.sent[m.ID] = true
+			w.mu.Unlock()
+			return nil
+		}
+		if errors.Is(err, ErrPermanent) {
+			break
+		}
+		// backoff: base·2^tentativa + jitter (evita "thundering herd" de retries sincronizados)
+		backoff := w.BaseDelay &lt;&lt; attempt
+		jitter := time.Duration(rand.Int64N(int64(w.BaseDelay) + 1))
+		w.Sleep(backoff + jitter)
+	}
+	w.mu.Lock()
+	w.DeadLetter = append(w.DeadLetter, m)
+	w.mu.Unlock()
+	return err
+}</code></pre>
+
+<h2 id="transacoes">Transações distribuídas: 2PC, sagas e outbox</h2>
+<h3>Two-phase commit (2PC)</h3>
+<p>Um coordenador pergunta a todos "pode commitar?" (prepare); se todos dizem sim, manda "commit". É atômico, mas <strong>bloqueante</strong>: se o coordenador cai depois do prepare, os participantes ficam presos com locks. Use dentro de um mesmo sistema (bancos distribuídos o usam internamente) e evite entre microsserviços.</p>
+<h3>Saga</h3>
+<p>Uma sequência de transações locais, em que cada passo tem uma <strong>ação compensatória</strong>. Exemplo de viagem: reservar voo → reservar hotel → cobrar cartão. Se a cobrança falhar, cancela o hotel e depois o voo.</p>
+<ul>
+<li><strong>Coreografia:</strong> cada serviço reage a eventos dos outros. Desacoplado, mas difícil de acompanhar.</li>
+<li><strong>Orquestração:</strong> um orquestrador (Temporal, Step Functions) comanda os passos. Mais visível e testável.</li>
+</ul>
+<p>Sagas dão consistência eventual (estados intermediários ficam visíveis), por isso os passos precisam ser idempotentes.</p>
+<h3>Transactional outbox</h3>
+<p>Problema: gravar no banco <em>e</em> publicar no Kafka de forma atômica (o "dual write"). Solução: na mesma transação do banco, inserir o evento numa tabela <code>outbox</code>; um processo (ou CDC com Debezium) lê a outbox e publica. Assim, ou acontecem as duas coisas, ou nenhuma.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  S[Serviço de pedidos] -->|"1 transação: INSERT pedido + INSERT outbox"| DB[(Postgres)]
+  DB -->|CDC / poller| R[Relay]
+  R -->|publica| K[[Kafka]]
+  K --> E[E-mail]
+  K --> A[Analytics]</pre></figure>
+
+<h2 id="falhas">Detecção de falhas e membership</h2>
+<ul>
+<li><strong>Heartbeats:</strong> cada nó avisa "estou vivo" periodicamente; sem aviso por X segundos, é suspeito.</li>
+<li><strong>Gossip:</strong> cada nó conversa com alguns nós aleatórios e troca sua tabela de heartbeats; a informação se espalha em O(log N) rodadas sem coordenador central (Cassandra, Consul).</li>
+<li><strong>Sloppy quorum + hinted handoff:</strong> se uma réplica está fora, outro nó guarda a escrita "em nome dela" e entrega quando ela voltar.</li>
+<li><strong>Anti-entropy com Merkle trees:</strong> compara hashes de faixas de chaves para sincronizar só o que diverge.</li>
+</ul>
+
+<h2 id="resiliencia">Padrões de resiliência</h2>
+<div class="table-wrap"><table>
+<tr><th>Padrão</th><th>Problema que resolve</th><th>Como</th></tr>
+<tr><td><strong>Timeout</strong></td><td>Chamada lenta prende threads e conexões</td><td>Sempre defina timeouts, menores que o do chamador</td></tr>
+<tr><td><strong>Retry com backoff exponencial + jitter</strong></td><td>Falhas transitórias</td><td>Espere base·2<sup>n</sup> + aleatório; limite as tentativas; só para operações idempotentes</td></tr>
+<tr><td><strong>Circuit breaker</strong></td><td>Dependência caída recebendo tráfego inútil</td><td>Após X falhas, "abre" e falha rápido; depois testa (half-open)</td></tr>
+<tr><td><strong>Bulkhead</strong></td><td>Uma dependência lenta esgota todos os recursos</td><td>Pools separados por dependência</td></tr>
+<tr><td><strong>Rate limiting</strong></td><td>Abuso e picos</td><td><a href="04-rate-limiter.html">Capítulo 4</a></td></tr>
+<tr><td><strong>Load shedding</strong></td><td>Sobrecarga leva ao colapso</td><td>Rejeitar parte do tráfego (de menor prioridade) cedo, com 503</td></tr>
+<tr><td><strong>Backpressure</strong></td><td>Produtor mais rápido que o consumidor</td><td>Filas limitadas; sinalizar ao produtor para desacelerar</td></tr>
+<tr><td><strong>Graceful degradation</strong></td><td>Falha parcial</td><td>Servir uma versão pior (feed sem recomendações, dados do cache)</td></tr>
+</table></div>
+
+<h2 id="arquitetura">Padrões de arquitetura</h2>
+<ul>
+<li><strong>Monólito × microsserviços:</strong> comece com monólito modular; separe quando houver times independentes, escalas diferentes ou isolamento de falhas. Microsserviços trazem rede, consistência eventual e operação.</li>
+<li><strong>Event-driven:</strong> serviços publicam eventos e outros reagem. Desacopla, mas o fluxo fica menos visível.</li>
+<li><strong>CQRS:</strong> modelos separados para escrita (normalizado, transacional) e leitura (desnormalizado e otimizado, por exemplo um feed pré-computado ou um índice no ES).</li>
+<li><strong>Event sourcing:</strong> o estado é derivado de um log imutável de eventos. Auditoria completa e replay (ledgers, bolsa de valores), ao custo de mais complexidade.</li>
+<li><strong>Cell-based architecture:</strong> isolar clientes em "células" independentes para limitar o raio de impacto de falhas.</li>
+</ul>
+
+<h2 id="isolamento">Níveis de isolamento (bônus)</h2>
+<div class="table-wrap"><table>
+<tr><th>Nível</th><th>Evita</th><th>Ainda permite</th></tr>
+<tr><td>Read committed (padrão Postgres)</td><td>Dirty reads</td><td>Non-repeatable reads, lost updates</td></tr>
+<tr><td>Repeatable read / snapshot</td><td>+ non-repeatable reads</td><td>Write skew</td></tr>
+<tr><td>Serializable</td><td>Tudo</td><td>— (mais lento, mais abortos)</td></tr>
+</table></div>
+<p><strong>Lost update</strong> clássico: duas pessoas compram o último item. Soluções: <code>SELECT … FOR UPDATE</code>, <code>UPDATE estoque SET qtd = qtd - 1 WHERE id = ? AND qtd &gt; 0</code> (atômico), ou lock otimista com versão.</p>
+
+<h2 id="quiz">Quiz</h2>
+<div class="quiz" data-answer="2"><div class="q">N=5. Qual combinação garante que a leitura veja a última escrita?</div>
+<button class="opt">W=2, R=2</button><button class="opt">W=1, R=3</button><button class="opt">W=3, R=3</button><button class="opt">W=2, R=1</button>
+<div class="why">É preciso W + R &gt; N: 3 + 3 = 6 &gt; 5.</div></div>
+<div class="quiz" data-answer="0"><div class="q">Como obter "exactly-once" na prática ao consumir de uma fila?</div>
+<button class="opt">At-least-once + consumidor idempotente</button><button class="opt">At-most-once</button><button class="opt">Desligar os retries</button><button class="opt">Usar UDP</button>
+<div class="why">Garanta a entrega com retries e torne o processamento seguro contra duplicatas.</div></div>
+<div class="quiz" data-answer="3"><div class="q">Quantos nós um cluster Raft precisa para tolerar 2 falhas?</div>
+<button class="opt">2</button><button class="opt">3</button><button class="opt">4</button><button class="opt">5</button>
+<div class="why">2f+1 = 5: a maioria (3) continua disponível com 2 nós fora.</div></div>
+<div class="quiz" data-answer="1"><div class="q">Você precisa gravar um pedido no Postgres e publicar "pedido criado" no Kafka sem risco de fazer só um dos dois. Padrão?</div>
+<button class="opt">Publicar primeiro e gravar depois</button><button class="opt">Transactional outbox</button><button class="opt">2PC entre Postgres e Kafka</button><button class="opt">Retry até dar certo</button>
+<div class="why">O evento é gravado na mesma transação local e publicado de forma assíncrona e confiável.</div></div>
+
+<h2 id="recursos">Vídeos e leituras</h2>
+<ul class="links">
+<li class="course"><a href="https://pdos.csail.mit.edu/6.824/" target="_blank" rel="noopener">MIT 6.5840 (6.824): Distributed Systems</a><small>Curso completo com labs em Go (Raft, KV store sharded). O melhor investimento para aprofundar.</small></li>
+<li class="video"><a href="https://www.youtube.com/playlist?list=PLeKd45zvjcDFUEv_ohr_HdUFe97RItdiB" target="_blank" rel="noopener">Martin Kleppmann: Distributed Systems (Cambridge)</a><small>8 aulas curtas e claras: tempo, replicação, quórum, consenso.</small></li>
+<li class="read"><a href="https://raft.github.io/" target="_blank" rel="noopener">Raft: visualização interativa e paper</a></li>
+<li class="read"><a href="https://jepsen.io/consistency" target="_blank" rel="noopener">Jepsen: mapa de modelos de consistência</a></li>
+<li class="read"><a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener">AWS: Timeouts, retries and backoff with jitter</a></li>
+<li class="read"><a href="https://microservices.io/patterns/data/transactional-outbox.html" target="_blank" rel="noopener">microservices.io: Transactional outbox</a> · <a href="https://microservices.io/patterns/data/saga.html" target="_blank" rel="noopener">Saga</a></li>
+<li class="video"><a href="https://www.youtube.com/@jordanhasnolife5163" target="_blank" rel="noopener">Jordan has no life (canal)</a><small>Séries profundas de conceitos de sistemas distribuídos para entrevistas.</small></li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>

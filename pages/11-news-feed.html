@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · News feed — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Capítulo 11 · Estudo de caso</span>
+<h1>Projete um news feed</h1>
+<p class="lead">Facebook, Instagram, X/Twitter, LinkedIn: o feed é a lista de posts das pessoas que você segue. O coração do problema é uma decisão: <strong>pré-computar o feed na escrita ou montá-lo na leitura?</strong></p>
+
+<div class="objectives"><h4>Ao final você saberá:</h4><ul>
+<li>Desenhar os fluxos de publicação e de leitura do feed.</li>
+<li>Comparar fanout on write, fanout on read e o modelo híbrido.</li>
+<li>Resolver o problema da celebridade.</li>
+<li>Organizar o cache em camadas e implementar o fanout híbrido em Go.</li>
+</ul></div>
+
+<h2 id="requisitos">Requisitos</h2>
+<div class="dialog">
+<p class="c">Mobile, web ou os dois?</p><p class="i">Os dois.</p>
+<p class="c">Funcionalidades principais?</p><p class="i">Publicar um post e ver o feed dos amigos.</p>
+<p class="c">Ordem cronológica reversa ou ranqueada (peso por proximidade, engajamento)?</p><p class="i">Para simplificar, cronológica reversa.</p>
+<p class="c">Quantos amigos uma pessoa pode ter?</p><p class="i">5.000.</p>
+<p class="c">Tráfego?</p><p class="i">10 milhões de DAU.</p>
+<p class="c">Mídia?</p><p class="i">Imagens e vídeos.</p>
+</div>
+
+<h2 id="api">APIs</h2>
+<pre><code class="language-http">POST /v1/me/feed     { content, media_ids[], auth_token }      → publica
+GET  /v1/me/feed?cursor=&lt;post_id&gt;&amp;limit=20                    → lê o feed</code></pre>
+<p>Use <strong>paginação por cursor</strong> (o último post_id visto), não por offset: com posts novos entrando no topo, o offset duplica ou pula itens e fica lento em páginas profundas.</p>
+
+<h2 id="publicacao">Fluxo de publicação</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  U[Usuário] -->|POST /feed| LB[LB] --> WS[Web servers: auth, rate limit]
+  WS --> PS[Post service]
+  PS --> PC[(Post cache)]
+  PS --> PDB[(Post DB)]
+  WS --> FS[Fanout service]
+  FS --> GDB[(Graph DB: seguidores)]
+  FS --> UC[(User cache/DB: settings, mutes)]
+  FS --> Q[[Fila]] --> FW[Fanout workers] --> NFC[(News feed cache: user_id → lista de post_ids)]
+  WS --> NS[Notification service]</pre></figure>
+
+<h2 id="fanout">Deep dive: fanout</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Fanout on write (push)</th><th>Fanout on read (pull)</th></tr>
+<tr><td>Quando</td><td>Na publicação, o post_id é escrito no feed de cada seguidor</td><td>Na leitura, buscam-se os posts recentes de cada pessoa seguida e mescla-se</td></tr>
+<tr><td>Leitura</td><td><strong>Rápida</strong>: o feed já está pronto</td><td>Lenta: N consultas + merge</td></tr>
+<tr><td>Escrita</td><td>Cara: 1 post × N seguidores. <strong>Celebridade com 100 milhões de seguidores = 100 milhões de escritas</strong></td><td>Barata</td></tr>
+<tr><td>Usuários inativos</td><td>Desperdício: computa feeds que ninguém lê</td><td>Sem desperdício</td></tr>
+<tr><td>Tempo real</td><td>Post aparece rápido</td><td>Também, mas cada leitura é custosa</td></tr>
+</table></div>
+<div class="box tip"><strong class="t">A resposta: modelo híbrido</strong>
+Push para a maioria (usuários com poucos seguidores, leitura rápida); <strong>pull para celebridades</strong>: os posts delas não são distribuídos e são buscados e mesclados na hora da leitura. Usar consistent hashing nos caches distribui a carga das leituras de celebridades. Bônus: só fazer fanout para seguidores ativos recentemente.</div>
+<div class="code-title">go/feed/feed.go: fanout híbrido (push + pull para celebridades)</div>
+<pre><code class="language-go" data-src="go/feed/feed.go">// Package feed implementa um news feed com modelo HÍBRIDO de fanout:
+//
+//   - Fanout on write (push): ao publicar, o post_id é inserido no cache de
+//     feed de cada seguidor. Leitura rapidíssima; escrita cara para quem tem
+//     milhões de seguidores (o "problema da celebridade").
+//   - Fanout on read (pull): o feed é montado na hora da leitura buscando os
+//     posts de quem a pessoa segue. Escrita barata; leitura lenta.
+//
+// Híbrido: push para usuários comuns, pull para celebridades (acima de um limiar).
+package feed
+
+import (
+	"slices"
+	"sync"
+)
+
+type Post struct {
+	ID       int64 // ID ordenável por tempo (Snowflake) — dispensa campo de timestamp
+	AuthorID string
+	Text     string
+}
+
+type Service struct {
+	mu                 sync.RWMutex
+	CelebrityThreshold int
+	MaxFeedSize        int // limita o cache de feed por usuário (ex.: 500 ids)
+
+	followers map[string]map[string]bool // autor -&gt; seguidores
+	following map[string]map[string]bool // usuário -&gt; quem segue
+	posts     map[int64]Post             // "post store"
+	byAuthor  map[string][]int64         // posts de cada autor (para o pull)
+	feedCache map[string][]int64         // feed pré-computado (para o push)
+}
+
+func NewService(celebrityThreshold, maxFeed int) *Service {
+	return &amp;Service{
+		CelebrityThreshold: celebrityThreshold, MaxFeedSize: maxFeed,
+		followers: map[string]map[string]bool{}, following: map[string]map[string]bool{},
+		posts: map[int64]Post{}, byAuthor: map[string][]int64{}, feedCache: map[string][]int64{},
+	}
+}
+
+func (s *Service) Follow(user, author string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.followers[author] == nil {
+		s.followers[author] = map[string]bool{}
+	}
+	if s.following[user] == nil {
+		s.following[user] = map[string]bool{}
+	}
+	s.followers[author][user] = true
+	s.following[user][author] = true
+}
+
+func (s *Service) isCelebrity(author string) bool {
+	return len(s.followers[author]) &gt;= s.CelebrityThreshold
+}
+
+// Publish grava o post e faz fanout on write se o autor não é celebridade.
+// Em produção o fanout é assíncrono: Publish enfileira e workers escrevem nos caches.
+func (s *Service) Publish(p Post) (fanout int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.posts[p.ID] = p
+	s.byAuthor[p.AuthorID] = append(s.byAuthor[p.AuthorID], p.ID)
+	if s.isCelebrity(p.AuthorID) {
+		return 0 // seguidores vão "puxar" na leitura
+	}
+	for f := range s.followers[p.AuthorID] {
+		feed := append([]int64{p.ID}, s.feedCache[f]...)
+		if len(feed) &gt; s.MaxFeedSize {
+			feed = feed[:s.MaxFeedSize]
+		}
+		s.feedCache[f] = feed
+		fanout++
+	}
+	return fanout
+}
+
+// Feed mescla o cache (push) com os posts recentes das celebridades seguidas (pull).
+func (s *Service) Feed(user string, limit int) []Post {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := slices.Clone(s.feedCache[user])
+	for author := range s.following[user] {
+		if s.isCelebrity(author) {
+			ids = append(ids, s.byAuthor[author]...)
+		}
+	}
+	slices.Sort(ids)
+	ids = slices.Compact(ids)
+	slices.Reverse(ids) // mais recentes primeiro
+	out := make([]Post, 0, limit)
+	for _, id := range ids {
+		if len(out) == limit {
+			break
+		}
+		out = append(out, s.posts[id]) // "hydration": id -&gt; conteúdo completo
+	}
+	return out
+}</code></pre>
+
+<h3>Como o fanout service trabalha</h3>
+<ol>
+<li>Busca os IDs dos seguidores no graph DB (ou numa tabela <code>follows</code> com índice).</li>
+<li>Filtra pelas configurações do usuário (mutados, bloqueados, feed restrito).</li>
+<li>Publica na fila: (post_id, lista de seguidores) em lotes.</li>
+<li>Workers inserem <code>post_id</code> no feed cache de cada seguidor: Redis <code>LPUSH</code> + <code>LTRIM</code> para manter só os N mais recentes (por exemplo, 500).</li>
+</ol>
+<p>O feed cache guarda <strong>só IDs</strong> (<code>&lt;post_id, user_id&gt;</code>): guardar o post completo multiplicaria a memória pelo número de seguidores. A maioria só rola os posts mais recentes, então o miss em posts antigos é raro.</p>
+
+<h2 id="leitura">Fluxo de leitura do feed</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  U[Usuário] -->|GET /feed| LB[LB] --> WS[Web servers]
+  WS --> NFS[News feed service]
+  NFS --> NFC[(Feed cache: post_ids)]
+  NFS --> CEL[Posts recentes das celebridades seguidas]
+  NFS --> PC[(Post cache: conteúdo)]
+  NFS --> UCa[(User cache: nome, foto)]
+  NFS -->|JSON hidratado| U
+  U -->|mídia| CDN[CDN]</pre></figure>
+<p>A <strong>hidratação</strong> (transformar IDs em posts completos com autor, contadores e mídia) é feita em lote (<code>MGET</code>) a partir dos caches de posts e usuários. Imagens e vídeos vêm da CDN.</p>
+
+<h2 id="cache">Cache em camadas</h2>
+<div class="table-wrap"><table>
+<tr><th>Camada</th><th>Conteúdo</th></tr>
+<tr><td>News feed</td><td>IDs dos posts do feed de cada usuário</td></tr>
+<tr><td>Conteúdo</td><td>Dados de cada post; posts populares num cache "quente" separado</td></tr>
+<tr><td>Social graph</td><td>Seguidores e seguidos</td></tr>
+<tr><td>Ação</td><td>Se o usuário curtiu, respondeu, compartilhou</td></tr>
+<tr><td>Contadores</td><td>Curtidas, respostas, seguidores (contadores em Redis, persistidos em lote)</td></tr>
+</table></div>
+
+<h2 id="dados">Modelo de dados e armazenamento</h2>
+<ul>
+<li><strong>Posts:</strong> post_id (Snowflake, ordenável por tempo), author_id, content, media_urls, created_at. Volume alto, acesso por id e por autor: Cassandra/DynamoDB, ou MySQL sharded por author_id.</li>
+<li><strong>Follows:</strong> <code>(follower_id, followee_id)</code> com índices nas duas direções, num relacional sharded ou num graph store (TAO no Facebook).</li>
+<li><strong>Mídia:</strong> S3 + CDN.</li>
+</ul>
+
+<h2 id="extras">Para o fechamento</h2>
+<ul>
+<li><strong>Ranking:</strong> o feed ranqueado busca ~500 candidatos (push + pull) e um modelo de ML pontua por afinidade, tipo de conteúdo e recência. O ranking acontece na leitura.</li>
+<li><strong>Edição e remoção:</strong> como o cache guarda IDs, basta atualizar ou marcar o post; na hidratação, posts removidos são filtrados.</li>
+<li><strong>Escala do banco:</strong> réplicas de leitura, sharding, e a camada web stateless.</li>
+<li><strong>Monitoramento:</strong> QPS em horários de pico, latência de atualização do feed.</li>
+</ul>
+
+<h2 id="simulacao">Simulação de entrevista</h2>
+<div class="dialog">
+<p class="i">Uma cantora com 80 milhões de seguidores posta. O que acontece no seu sistema?</p>
+<p class="c">Ela está acima do limiar de celebridade (por exemplo, 100 mil seguidores), então o post <em>não</em> é distribuído. Ele é gravado no post store e aparece num cache "posts recentes por autor". Quando um fã abre o feed, o serviço pega o feed pré-computado dele (push) e mescla com os posts recentes das poucas celebridades que ele segue (pull), ordenando por post_id. Isso troca 80 milhões de escritas por uma leitura extra, barata e muito cacheada, por fã.</p>
+<p class="i">Mas 80 milhões de fãs vão ler o mesmo post ao mesmo tempo: hot key.</p>
+<p class="c">Sim, o post dessa celebridade vira a chave mais quente do cache. Eu replicaria esse objeto em vários nós de cache (a chave com sufixo aleatório na leitura) e manteria um cache local in-process nos servidores de feed com TTL de poucos segundos. Os contadores de curtidas desse post também são quentes: acumulo incrementos em memória e gravo em lote, e mostro números aproximados.</p>
+<p class="i">E um usuário comum com 3 mil seguidores?</p>
+<p class="c">Push assíncrono: o post entra na fila e os workers fazem <code>LPUSH</code>/<code>LTRIM</code> nos feeds de 3 mil seguidores em alguns lotes. Se esses seguidores não abrem o app há 30 dias, pulo o fanout para eles e o feed deles é montado por pull quando voltarem.</p>
+<p class="i">Qual latência entre postar e aparecer?</p>
+<p class="c">Para usuários comuns, a latência da fila mais a escrita no cache, normalmente abaixo de alguns segundos. Monitoro a idade das mensagens na fila de fanout como SLI.</p>
+</div>
+
+<h2 id="quiz">Quiz</h2>
+<div class="quiz" data-answer="1"><div class="q">Por que o feed cache guarda só IDs?</div>
+<button class="opt">IDs são mais seguros</button><button class="opt">Guardar o post inteiro em cada feed multiplicaria a memória pelo número de seguidores</button><button class="opt">O Redis não aceita JSON</button><button class="opt">Para ordenar mais rápido</button>
+<div class="why">O conteúdo fica em um único lugar (post cache); o feed referencia.</div></div>
+<div class="quiz" data-answer="0"><div class="q">Principal problema do fanout on write puro?</div>
+<button class="opt">Celebridades geram milhões de escritas por post</button><button class="opt">Leitura lenta</button><button class="opt">Não funciona com cache</button><button class="opt">Perde posts</button>
+<div class="why">É o problema da celebridade; daí o modelo híbrido.</div></div>
+<div class="quiz" data-answer="2"><div class="q">Melhor paginação para um feed que recebe itens novos constantemente?</div>
+<button class="opt">OFFSET/LIMIT</button><button class="opt">Número da página</button><button class="opt">Cursor (último post_id visto)</button><button class="opt">Sem paginação</button>
+<div class="why">Estável com inserções no topo e eficiente em qualquer profundidade.</div></div>
+
+<h2 id="recursos">Vídeos e leituras</h2>
+<ul class="links">
+<li class="read"><a href="https://www.hellointerview.com/learn/system-design/problem-breakdowns/fb-news-feed" target="_blank" rel="noopener">Hello Interview: Facebook News Feed</a></li>
+<li class="read"><a href="https://www.usenix.org/system/files/conference/atc13/atc13-bronson.pdf" target="_blank" rel="noopener">TAO: Facebook's Distributed Data Store for the Social Graph</a></li>
+<li class="read"><a href="https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf" target="_blank" rel="noopener">Scaling Memcache at Facebook</a></li>
+<li class="video"><a href="https://www.youtube.com/results?search_query=twitter+timeline+architecture+raffi+krikorian" target="_blank" rel="noopener">Timelines at Scale (Raffi Krikorian, Twitter)</a><small>A palestra clássica sobre fanout no Twitter.</small></li>
+<li class="video"><a href="https://www.youtube.com/results?search_query=bytebytego+news+feed+system+design" target="_blank" rel="noopener">ByteByteGo: News feed</a></li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>

@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Encurtador de URL — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Capítulo 08 · Estudo de caso</span>
+<h1>Projete um encurtador de URL</h1>
+<p class="lead">O "hello world" do system design, pedido em entrevistas de todos os níveis. Simples na superfície, mas com decisões ótimas para discutir: geração do código, redirecionamento, cache e escala de leitura.</p>
+
+<div class="objectives"><h4>Ao final você saberá:</h4><ul>
+<li>Estimar escrita, leitura e armazenamento e derivar o tamanho do código curto.</li>
+<li>Comparar hash + resolução de colisão × ID único + base62.</li>
+<li>Escolher entre 301 e 302.</li>
+<li>Implementar base62 e o serviço em Go.</li>
+</ul></div>
+
+<h2 id="requisitos">Requisitos</h2>
+<div class="dialog">
+<p class="c">Pode dar um exemplo?</p><p class="i"><code>https://www.systeminterview.com/q=chatsystem&amp;c=loggedin&amp;v=v3&amp;l=long</code> vira <code>https://tinyurl.com/y7keocwj</code>, e clicar no curto redireciona para o longo.</p>
+<p class="c">Volume?</p><p class="i">100 milhões de URLs geradas por dia.</p>
+<p class="c">Quão curto?</p><p class="i">O mais curto possível.</p>
+<p class="c">Quais caracteres?</p><p class="i">Números e letras: [0-9a-zA-Z].</p>
+<p class="c">Pode apagar ou atualizar?</p><p class="i">Para simplificar, não.</p>
+</div>
+<ul><li><strong>Funcionais:</strong> encurtar e redirecionar.</li><li><strong>Não funcionais:</strong> alta disponibilidade, escalabilidade, tolerância a falhas; redirecionamento com baixa latência.</li></ul>
+
+<h2 id="estimativas">Estimativas</h2>
+<ul>
+<li>Escritas: 100 M/dia ÷ 10<sup>5</sup> ≈ <strong>1.160/s</strong>.</li>
+<li>Leituras (assumindo 10:1): <strong>11.600/s</strong>.</li>
+<li>Em 10 anos: 100 M × 365 × 10 = <strong>365 bilhões</strong> de registros.</li>
+<li>URL média de 100 bytes, então 365 bi × 100 B ≈ <strong>36,5 TB</strong>.</li>
+</ul>
+<p><strong>Tamanho do código:</strong> com 62 caracteres, precisamos de 62<sup>n</sup> ≥ 365 bilhões. 62<sup>6</sup> ≈ 56,8 bilhões (pouco); 62<sup>7</sup> ≈ <strong>3,5 trilhões</strong>. Então <strong>n = 7</strong>.</p>
+
+<h2 id="api">API</h2>
+<pre><code class="language-http">POST /api/v1/data/shorten
+     { "longUrl": "https://..." }          → 201 { "shortUrl": "https://sho.rt/zn9edcu" }
+
+GET  /api/v1/{shortCode}                   → 301/302  Location: https://...longUrl</code></pre>
+
+<h2 id="redirect">301 × 302</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>301 Moved Permanently</th><th>302 Found (temporário)</th></tr>
+<tr><td>Cache no navegador</td><td>Sim: próximas visitas nem chegam ao servidor</td><td>Não: toda visita passa pelo serviço</td></tr>
+<tr><td>Carga no servidor</td><td>Menor</td><td>Maior</td></tr>
+<tr><td>Analytics (cliques, origem, país)</td><td>Perde</td><td>Completo</td></tr>
+<tr><td>Escolha quando</td><td>Prioridade é reduzir carga</td><td>Analytics é parte do produto (bit.ly)</td></tr>
+</table></div>
+
+<h2 id="alto-nivel">Design de alto nível</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  U[Usuário] -->|"GET /zn9edcu"| LB[Load balancer]
+  LB --> WS[Web servers stateless]
+  WS -->|1. busca| C[(Cache: Redis)]
+  WS -->|2. miss| DB[(Banco: id, shortURL, longURL)]
+  WS -->|"3. 301/302 Location: longURL"| U
+  WS -->|POST shorten| IDG[Gerador de IDs: Snowflake]
+  WS -.->|"evento de clique (se 302)"| K[[Kafka]] -.-> AN[(Analytics: ClickHouse)]</pre></figure>
+<p>A tabela é simples: <code>(id PK, short_url UNIQUE, long_url, created_at)</code>, mais um índice em <code>long_url</code> (ou no hash dela) para devolver o mesmo código se a URL já existir.</p>
+
+<h2 id="hash">Deep dive: gerar o código curto</h2>
+<h3>Opção A: hash + resolução de colisão</h3>
+<p>Aplicar CRC32, MD5 ou SHA-1 à URL longa e pegar os 7 primeiros caracteres. Mas 7 caracteres de um hash colidem. Solução: se colidir, concatenar um sufixo predefinido à URL e refazer o hash até não colidir.</p>
+<ul>
+<li>Cada geração exige consultar o banco para ver se o código existe, o que é caro. Um <strong>Bloom filter</strong> acelera a checagem.</li>
+<li>Vantagem: a mesma URL gera o mesmo código naturalmente; não precisa de gerador de IDs.</li>
+</ul>
+<h3>Opção B: ID único + conversão base62</h3>
+<p>Gere um ID numérico único (<a href="07-unique-id.html">Snowflake</a>, contador distribuído ou faixas de IDs pré-alocadas) e converta para base62. Exemplo: 11157 = 2×62² + 55×62 + 59, que vira "2" "T" "X" = <code>2TX</code>.</p>
+<div class="table-wrap"><table>
+<tr><th></th><th>Hash + colisão</th><th>ID + base62</th></tr>
+<tr><td>Tamanho do código</td><td>Fixo (7)</td><td>Variável, cresce com o ID</td></tr>
+<tr><td>Gerador de IDs</td><td>Não precisa</td><td>Precisa (distribuído)</td></tr>
+<tr><td>Colisão</td><td>Possível, precisa resolver</td><td>Impossível (ID único)</td></tr>
+<tr><td>Próximo código adivinhável?</td><td>Não</td><td>Sim, se o ID for sequencial (risco de enumeração)</td></tr>
+</table></div>
+<div class="box tip"><strong class="t">Escolha comum</strong>ID + base62. Para não ser adivinhável, embaralhe o ID com uma permutação reversível (por exemplo, uma pequena cifra de Feistel ou multiplicação por um inverso modular) antes da conversão, ou use um Snowflake, cujos IDs não são consecutivos.</div>
+
+<h3>Fluxo de encurtamento</h3>
+<ol>
+<li>Recebe a URL longa.</li>
+<li>Ela já está no banco? Devolve o código existente.</li>
+<li>Senão, gera um ID único, converte para base62 e grava (id, short, long).</li>
+</ol>
+<div class="code-title">go/shortener/shortener.go</div>
+<pre><code class="language-go" data-src="go/shortener/shortener.go">// Package shortener implementa um encurtador de URL usando
+// "ID único + conversão base62" — a abordagem sem colisões.
+//
+// Fluxo de escrita:  longURL → já existe? devolve o short → senão gera ID
+// único (ex.: Snowflake ou contador distribuído) → base62(ID) → salva.
+// Fluxo de leitura:  GET /{short} → cache → banco → 301/302 para longURL.
+package shortener
+
+import (
+	"errors"
+	"net/http"
+	"strings"
+	"sync"
+)
+
+const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+// Encode converte um inteiro para base62. 62^7 ≈ 3,5 trilhões de URLs com 7 chars.
+func Encode(n uint64) string {
+	if n == 0 {
+		return string(alphabet[0])
+	}
+	var b [11]byte // 62^11 &gt; 2^64
+	i := len(b)
+	for n &gt; 0 {
+		i--
+		b[i] = alphabet[n%62]
+		n /= 62
+	}
+	return string(b[i:])
+}
+
+func Decode(s string) (uint64, error) {
+	var n uint64
+	for _, c := range s {
+		idx := strings.IndexRune(alphabet, c)
+		if idx &lt; 0 {
+			return 0, errors.New("caractere inválido em base62")
+		}
+		n = n*62 + uint64(idx)
+	}
+	return n, nil
+}
+
+// IDGenerator abstrai o gerador de IDs únicos (Snowflake, ticket server, range de IDs…).
+type IDGenerator interface{ Next() (int64, error) }
+
+// Service guarda os mapeamentos. Em produção: tabela (id, short, long) em
+// um banco + cache (Redis) na frente para as leituras (read-heavy ~100:1).
+type Service struct {
+	mu      sync.RWMutex
+	ids     IDGenerator
+	byShort map[string]string
+	byLong  map[string]string // índice para não duplicar a mesma URL longa
+}
+
+func NewService(ids IDGenerator) *Service {
+	return &amp;Service{ids: ids, byShort: map[string]string{}, byLong: map[string]string{}}
+}
+
+func (s *Service) Shorten(long string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if short, ok := s.byLong[long]; ok {
+		return short, nil
+	}
+	id, err := s.ids.Next()
+	if err != nil {
+		return "", err
+	}
+	short := Encode(uint64(id))
+	s.byShort[short] = long
+	s.byLong[long] = short
+	return short, nil
+}
+
+func (s *Service) Resolve(short string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	long, ok := s.byShort[short]
+	return long, ok
+}
+
+// ServeHTTP faz o redirecionamento.
+//   - 301 (Moved Permanently): o navegador cacheia; menos carga, mas você perde analytics.
+//   - 302 (Found): toda visita passa pelo serviço; permite contar cliques.
+func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	long, ok := s.Resolve(strings.TrimPrefix(r.URL.Path, "/"))
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	http.Redirect(w, r, long, http.StatusFound)
+}</code></pre>
+
+<h2 id="redirecionamento">Deep dive: redirecionamento em escala</h2>
+<ul>
+<li><strong>Leitura muito maior que escrita:</strong> cache <code>short → long</code> no Redis. Com 20% das URLs gerando 80% do tráfego, um cache de algumas dezenas de GB dá um hit rate altíssimo.</li>
+<li>Dados imutáveis (sem update), então o cache nunca fica inconsistente. TTL longo e LRU.</li>
+<li><strong>Banco:</strong> 36 TB e acesso por chave pedem um KV/NoSQL particionado por <code>short_url</code> (DynamoDB, Cassandra) ou um relacional sharded. Réplicas para leitura.</li>
+<li><strong>Latência global:</strong> servidores de redirect em várias regiões, com o cache local e replicação assíncrona dos dados (consistência eventual é aceitável: uma URL recém-criada leva alguns segundos para aparecer em outra região, ou cai no fallback para a região de origem).</li>
+<li>Para 301, o próprio navegador cacheia; respostas de redirect também podem ficar na CDN.</li>
+</ul>
+
+<h2 id="extras">Para o fechamento</h2>
+<ul>
+<li><strong>Rate limiter</strong> no POST: evita que um usuário mal-intencionado esgote IDs ou use o serviço para spam.</li>
+<li><strong>Segurança:</strong> checar URLs maliciosas (Google Safe Browsing), página de aviso.</li>
+<li><strong>Analytics:</strong> com 302, publicar eventos de clique no Kafka e agregar em batch/stream.</li>
+<li><strong>Expiração:</strong> TTL por URL e limpeza preguiçosa (na leitura) + job periódico.</li>
+<li><strong>Códigos personalizados</strong> (<code>sho.rt/minha-marca</code>): checar disponibilidade com constraint UNIQUE.</li>
+</ul>
+
+<h2 id="simulacao">Simulação de entrevista</h2>
+<div class="dialog">
+<p class="i">Por que não simplesmente usar MD5 da URL e pegar 7 caracteres?</p>
+<p class="c">Daria certo para começar, e tem a vantagem de que a mesma URL gera o mesmo código sem consultar nada. O problema são as colisões: 7 caracteres base62 de um hash dão ~3,5 trilhões de combinações e vamos guardar 365 bilhões, então pelo paradoxo do aniversário colisões aparecem cedo. Cada escrita precisaria checar o banco e, se colidir, refazer com um sufixo. Prefiro gerar um ID único e converter para base62: zero colisão por construção.</p>
+<p class="i">Mas aí você precisa de um gerador de IDs distribuído.</p>
+<p class="c">Sim. Escrevemos ~1.200/s, então um esquema simples basta: cada servidor pega uma faixa de 10 mil IDs de um contador central (Redis INCRBY ou uma linha no banco) e a consome localmente. Se o servidor morre, perdemos alguns IDs da faixa, o que é irrelevante. Isso evita depender de um serviço a cada criação.</p>
+<p class="i">IDs sequenciais deixam alguém enumerar todas as URLs.</p>
+<p class="c">Verdade, e algumas URLs encurtadas são privadas, como documentos compartilhados. Eu passaria o ID por uma permutação bijetiva no espaço de 62<sup>7</sup>, com uma cifra de Feistel e uma chave secreta: continua único e reversível, mas consecutivos não parecem consecutivos.</p>
+<p class="i">Onde está o gargalo?</p>
+<p class="c">Nas leituras: ~12 mil/s, com picos virais muito maiores numa única URL. O cache Redis resolve a maioria; para uma URL viral, ela vira hot key e eu adicionaria cache local in-process nos web servers com TTL de segundos, ou deixaria a CDN responder o redirect.</p>
+</div>
+
+<h2 id="quiz">Quiz</h2>
+<div class="quiz" data-answer="2"><div class="q">Quantos caracteres base62 cobrem 365 bilhões de URLs?</div>
+<button class="opt">5</button><button class="opt">6</button><button class="opt">7</button><button class="opt">10</button>
+<div class="why">62<sup>6</sup> ≈ 57 bi (insuficiente); 62<sup>7</sup> ≈ 3,5 tri.</div></div>
+<div class="quiz" data-answer="1"><div class="q">O produto quer contar cliques por país. Qual redirect usar?</div>
+<button class="opt">301</button><button class="opt">302</button><button class="opt">200 com JavaScript</button><button class="opt">404</button>
+<div class="why">302 não é cacheado pelo navegador, então cada clique passa pelo serviço.</div></div>
+<div class="quiz" data-answer="0"><div class="q">Por que o cache é tão eficaz aqui?</div>
+<button class="opt">Os mapeamentos são imutáveis e o tráfego é concentrado em poucas URLs</button><button class="opt">Porque o Redis é persistente</button><button class="opt">Porque as URLs são curtas</button><button class="opt">Porque usamos 301</button>
+<div class="why">Sem invalidação, sem inconsistência, e com uma distribuição de acesso bem enviesada.</div></div>
+
+<h2 id="recursos">Vídeos e leituras</h2>
+<ul class="links">
+<li class="video"><a href="https://www.youtube.com/results?search_query=hello+interview+design+bitly" target="_blank" rel="noopener">Hello Interview: Design Bit.ly</a></li>
+<li class="read"><a href="https://www.hellointerview.com/learn/system-design/problem-breakdowns/bitly" target="_blank" rel="noopener">Hello Interview: breakdown escrito do Bit.ly</a></li>
+<li class="video"><a href="https://www.youtube.com/results?search_query=bytebytego+url+shortener" target="_blank" rel="noopener">ByteByteGo: URL shortener</a></li>
+<li class="read"><a href="https://github.com/donnemartin/system-design-primer/blob/master/solutions/system_design/pastebin/README.md" target="_blank" rel="noopener">System Design Primer: Pastebin/Bit.ly</a></li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>

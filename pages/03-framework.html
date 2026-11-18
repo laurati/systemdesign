@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Framework da entrevista — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Capítulo 03 · Fundamentos</span>
+<h1>Um framework para a entrevista de system design</h1>
+<p class="lead">Quatro passos para não se perder em 45 minutos: entender o problema, propor o alto nível, aprofundar e fechar. Use em todo estudo de caso deste site.</p>
+
+<div class="objectives"><h4>Ao final você saberá:</h4><ul>
+<li>Conduzir a entrevista com um roteiro previsível, mas flexível.</li>
+<li>Distribuir o tempo entre as fases.</li>
+<li>Fazer as perguntas de clarificação certas.</li>
+<li>Evitar os erros que mais reprovam candidatos.</li>
+</ul></div>
+
+<h2 id="visao">Visão geral e tempo</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  A["1. Entender o problema e definir escopo: 3–10 min"] --> B["2. Design de alto nível e buy-in: 10–15 min"]
+  B --> C["3. Deep dive: 10–25 min"]
+  C --> D["4. Fechamento: 3–5 min"]</pre>
+<figcaption>Para uma entrevista de 45 minutos. Em 60 minutos, o deep dive ganha mais tempo.</figcaption></figure>
+
+<h2 id="passo1">Passo 1: entender o problema e definir o escopo</h2>
+<p>O erro número um é sair desenhando. Responder rápido não dá pontos extras: o sinal que conta é a <strong>capacidade de transformar um pedido vago em requisitos claros</strong>. Pergunte, escreva as respostas e, quando a pessoa entrevistadora devolver "o que você acha?", faça premissas razoáveis e anote.</p>
+
+<h3>Perguntas que funcionam em quase todo problema</h3>
+<div class="table-wrap"><table>
+<tr><th>Categoria</th><th>Perguntas</th></tr>
+<tr><td>Funcionalidades</td><td>Quais são as 2 ou 3 funcionalidades mais importantes? O que está fora do escopo?</td></tr>
+<tr><td>Usuários</td><td>Quem usa? Quantos usuários (DAU/MAU)? Mobile, web ou os dois?</td></tr>
+<tr><td>Escala</td><td>Qual o crescimento esperado em 3, 6 ou 12 meses? Tráfego de leitura × escrita?</td></tr>
+<tr><td>Dados</td><td>Que tipo de dado (texto, imagem, vídeo)? Tamanho médio? Por quanto tempo guardar?</td></tr>
+<tr><td>Consistência</td><td>Pode ter atraso (consistência eventual) ou precisa ser imediato e exato (dinheiro, estoque)?</td></tr>
+<tr><td>Latência e disponibilidade</td><td>Qual latência aceitável? O sistema pode cair? É global?</td></tr>
+<tr><td>Contexto</td><td>Há infraestrutura existente que devo usar ou evitar? Cloud?</td></tr>
+</table></div>
+
+<h3>Saída do passo 1 (escreva no quadro)</h3>
+<pre><code class="language-text">Funcionais:
+  - usuário publica post (texto + imagem)
+  - usuário vê feed dos amigos, ordenado por tempo
+  Fora do escopo: anúncios, busca, ranking por ML
+
+Não funcionais:
+  - 10M DAU, 5k amigos no máximo
+  - leitura do feed < 200 ms (p99)
+  - alta disponibilidade > consistência (eventual ok, até alguns segundos)
+
+Estimativas: ~2k posts/s de pico, ~100k leituras de feed/s de pico</code></pre>
+<div class="box tip"><strong class="t">Requisitos não funcionais são o que define a arquitetura</strong>
+Os funcionais dizem <em>o que</em> o sistema faz; os não funcionais (escala, latência, disponibilidade, consistência, durabilidade) dizem <em>como</em> ele precisa ser construído. Deixe-os explícitos, porque você vai citá-los para justificar cada escolha: "como priorizamos disponibilidade, escolhi um store AP…".</div>
+
+<h2 id="passo2">Passo 2: propor o design de alto nível e obter buy-in</h2>
+<p>Objetivo: um desenho <strong>completo e simples</strong> que atenda a todos os requisitos funcionais. Trate a pessoa entrevistadora como colega de time.</p>
+<ol>
+<li><strong>Defina as APIs</strong> (os contratos entre cliente e servidor):
+<pre><code class="language-http">POST /v1/posts            { content, media_ids[] }     → 201 { post_id }
+GET  /v1/feed?cursor=…&amp;limit=20                        → 200 { posts[], next_cursor }</code></pre></li>
+<li><strong>Desenhe os componentes</strong>: clientes, LB, serviços, bancos, cache, filas, CDN, object storage.</li>
+<li><strong>Percorra os fluxos principais</strong> em cima do desenho: "quando o usuário publica, a requisição vai para…".</li>
+<li><strong>Esboce o modelo de dados</strong>: entidades principais, chaves e qual banco.</li>
+<li>Faça as estimativas que importam para as escolhas (veja o <a href="02-estimativas.html">capítulo 2</a>).</li>
+<li><strong>Peça buy-in</strong>: "isso cobre os requisitos? Faz sentido eu aprofundar em X?".</li>
+</ol>
+<div class="box warn"><strong class="t">Não otimize cedo</strong>
+Não comece por sharding, Kafka e Kubernetes. Primeiro faça funcionar de ponta a ponta. Depois identifique os gargalos <em>com base nos números</em> e evolua. Mostrar essa evolução já é um sinal forte.</div>
+
+<h2 id="passo3">Passo 3: deep dive</h2>
+<p>Agora vocês concordaram com o alto nível. A pessoa entrevistadora pode escolher o foco ("me fale mais sobre o fanout") ou deixar com você. Escolha os componentes <strong>mais críticos ou mais difíceis</strong> do problema:</p>
+<div class="table-wrap"><table>
+<tr><th>Problema</th><th>Deep dives típicos</th></tr>
+<tr><td>Encurtador de URL</td><td>Geração do short code (hash × base62), colisões, cache, 301 × 302</td></tr>
+<tr><td>Chat</td><td>WebSocket e roteamento entre servidores, ordenação de mensagens, presença, multi-dispositivo</td></tr>
+<tr><td>News feed</td><td>Fanout on write × on read, celebridades, cache</td></tr>
+<tr><td>Rate limiter</td><td>Algoritmo, store distribuído, race conditions</td></tr>
+<tr><td>YouTube</td><td>Pipeline de transcodificação, streaming adaptativo, custo de CDN</td></tr>
+<tr><td>Ticketmaster</td><td>Concorrência em reservas, pico de demanda, fila virtual</td></tr>
+</table></div>
+<p>Em cada deep dive, cubra: <strong>modelo de dados e acesso</strong>, <strong>escala</strong> (onde particionar? hotspots?), <strong>consistência</strong> e <strong>falhas</strong> (o que acontece se X cair? retry? idempotência?). Não gaste 10 minutos explicando um algoritmo de hash que ninguém pediu.</p>
+
+<h2 id="passo4">Passo 4: fechamento</h2>
+<p>Nos minutos finais:</p>
+<ul>
+<li><strong>Identifique gargalos</strong> e melhorias. Nenhum design é perfeito, e dizer onde o seu quebra mostra maturidade.</li>
+<li><strong>Recapitule</strong> o design em 30 segundos.</li>
+<li><strong>Casos de erro</strong>: servidor cai, rede particiona, mensagem perdida.</li>
+<li><strong>Operação</strong>: métricas, logs, alertas, deploy (canary, rollback).</li>
+<li><strong>Próxima escala</strong>: o que muda de 1 milhão para 10 milhões de usuários?</li>
+</ul>
+
+<h2 id="dos-donts">O que fazer e o que evitar</h2>
+<div class="procon">
+<div class="pro"><h5>Faça</h5><ul>
+<li>Pergunte e confirme premissas.</li>
+<li>Pense em voz alta.</li>
+<li>Proponha mais de uma abordagem e compare.</li>
+<li>Use números para decidir.</li>
+<li>Comece simples e evolua.</li>
+<li>Ouça as dicas: são presentes.</li>
+<li>Gerencie o tempo e não fique presa num detalhe.</li>
+</ul></div>
+<div class="con"><h5>Evite</h5><ul>
+<li>Chegar sem ter estudado os problemas clássicos.</li>
+<li>Desenhar antes de entender o problema.</li>
+<li>Ficar em silêncio pensando.</li>
+<li>Despejar nomes de tecnologia sem dizer o porquê ("usei Kafka porque sim").</li>
+<li>Achar que acabou quando o desenho ficou pronto.</li>
+<li>Defender uma escolha ruim por teimosia.</li>
+<li>Entrar em detalhes de um componente no passo 2.</li>
+</ul></div>
+</div>
+
+<h2 id="frases">Frases úteis</h2>
+<div class="table-wrap"><table>
+<tr><th>Situação</th><th>Frase</th></tr>
+<tr><td>Começar</td><td>"Antes de desenhar, quero fazer algumas perguntas para delimitar o escopo."</td></tr>
+<tr><td>Premissa</td><td>"Vou assumir 10 milhões de DAU e 10:1 de leitura para escrita. Faz sentido?"</td></tr>
+<tr><td>Trade-off</td><td>"Tenho duas opções: A dá menor latência mas é mais complexa; B é simples, mas… Dado que priorizamos X, vou de A."</td></tr>
+<tr><td>Não sabe</td><td>"Não trabalhei com isso diretamente, mas meu raciocínio seria…"</td></tr>
+<tr><td>Checar alinhamento</td><td>"Esse alto nível cobre o que você esperava? Onde prefere que eu aprofunde?"</td></tr>
+<tr><td>Gargalo</td><td>"O ponto fraco desse design é X; com 10× de tráfego eu faria Y."</td></tr>
+</table></div>
+
+<h2 id="template">Template para praticar</h2>
+<pre><code class="language-text">1. REQUISITOS (5 min)
+   Funcionais: ...
+   Não funcionais: escala | latência | disponibilidade × consistência | durabilidade
+   Fora do escopo: ...
+2. ESTIMATIVAS (2–5 min, só o que importa)
+   QPS leitura/escrita (pico) | armazenamento | banda
+3. API (3 min)
+4. MODELO DE DADOS (3 min): entidades, chaves, qual banco e por quê
+5. ALTO NÍVEL (10 min): desenhar e percorrer os fluxos
+6. DEEP DIVES (15 min): 2–3 componentes críticos; escala, consistência, falhas
+7. FECHAMENTO (3 min): gargalos, monitoramento, evolução</code></pre>
+
+<h2 id="simulacao">Simulação: os primeiros 5 minutos de "projete o Instagram"</h2>
+<div class="dialog">
+<p class="i">Projete o Instagram.</p>
+<p class="c">Legal. O Instagram é grande, então quero focar no núcleo. Posso assumir que o essencial é: postar fotos com legenda, seguir pessoas e ver um feed com as fotos de quem sigo? Stories, Reels, DMs e busca ficariam de fora.</p>
+<p class="i">Sim, foque nisso. Adicione curtidas também.</p>
+<p class="c">Certo. Qual escala devo considerar? Algo como 500 milhões de DAU?</p>
+<p class="i">Pode ser.</p>
+<p class="c">E o feed é cronológico ou ranqueado?</p>
+<p class="i">Comece cronológico.</p>
+<p class="c">Para não funcionais, vou assumir: carregar o feed em menos de 200 ms, alta disponibilidade, e tolerância a consistência eventual, então tudo bem se um post aparecer para os seguidores alguns segundos depois. Mas o upload em si precisa ser durável: foto aceita não pode sumir. Faz sentido?</p>
+<p class="i">Faz.</p>
+<p class="c">Uma estimativa rápida que vai guiar o armazenamento: se 10% dos DAU postam uma foto por dia, são 50 M fotos/dia × ~2 MB = 100 TB/dia. Isso vai direto para object storage com CDN. Leituras são muito maiores que escritas, talvez 100:1, então o feed precisa ser pré-computado ou muito bem cacheado. Vou começar pela API…</p>
+<p class="n">Repare: a candidata cortou o escopo, confirmou premissas, transformou não funcionais em decisões ("vai para object storage", "pré-computado") e só então avançou.</p>
+</div>
+
+<h2 id="quiz">Quiz</h2>
+<div class="quiz" data-answer="2"><div class="q">Qual é a primeira coisa a fazer ao receber o enunciado?</div>
+<button class="opt">Desenhar o diagrama de alto nível</button><button class="opt">Calcular QPS e armazenamento</button><button class="opt">Fazer perguntas para definir escopo e requisitos</button><button class="opt">Escolher o banco de dados</button>
+<div class="why">Sem requisitos claros, todo o resto pode estar resolvendo o problema errado.</div></div>
+<div class="quiz" data-answer="1"><div class="q">Em 45 minutos, quanto tempo é razoável para o deep dive?</div>
+<button class="opt">2–5 min</button><button class="opt">10–25 min</button><button class="opt">30–40 min</button><button class="opt">Não deve haver deep dive</button>
+<div class="why">É a fase mais longa: onde você mostra profundidade técnica.</div></div>
+<div class="quiz" data-answer="3"><div class="q">A pessoa entrevistadora diz: "e se um servidor de chat cair?". O que isso significa?</div>
+<button class="opt">Ela quer encerrar a entrevista</button><button class="opt">Você errou o design</button><button class="opt">É hora de mudar de assunto</button><button class="opt">É um convite para discutir tolerância a falhas: um deep dive</button>
+<div class="why">Perguntas assim direcionam para onde ela quer ver profundidade. Aproveite.</div></div>
+
+<h2 id="recursos">Vídeos e leituras</h2>
+<ul class="links">
+<li class="read"><a href="https://www.hellointerview.com/learn/system-design/in-a-hurry/delivery" target="_blank" rel="noopener">Hello Interview: Delivery framework</a><small>Um framework parecido, com ênfase em entidades e APIs.</small></li>
+<li class="video"><a href="https://www.youtube.com/results?search_query=system+design+interview+framework+step+by+step+bytebytego" target="_blank" rel="noopener">ByteByteGo: framework da entrevista</a></li>
+<li class="video"><a href="https://www.youtube.com/@hello_interview" target="_blank" rel="noopener">Hello Interview (canal)</a><small>Mock interviews completas, feitas por ex-entrevistadores de big techs.</small></li>
+<li class="course"><a href="https://www.tryexponent.com/courses/system-design-interview" target="_blank" rel="noopener">Exponent: System Design Interview course</a><small>Muitas mock interviews em vídeo.</small></li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>

@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Estimativas — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Capítulo 02 · Fundamentos</span>
+<h1>Estimativas (back-of-the-envelope)</h1>
+<p class="lead">Contas de guardanapo para descobrir se um design é viável: quantas requisições por segundo, quanto armazenamento, quantos servidores. O processo vale mais que o número exato.</p>
+
+<div class="objectives"><h4>Ao final você saberá:</h4><ul>
+<li>As potências de 2 e as ordens de grandeza de latência que todo engenheiro deve saber.</li>
+<li>Calcular QPS médio e de pico, armazenamento, banda e cache.</li>
+<li>Converter "noves" de disponibilidade em downtime.</li>
+<li>Usar números para justificar (ou descartar) decisões de arquitetura.</li>
+</ul></div>
+
+<h2 id="potencias">Potências de 2</h2>
+<div class="table-wrap"><table>
+<tr><th>Potência</th><th>Valor aproximado</th><th>Nome</th><th>Abrev.</th></tr>
+<tr><td>2<sup>10</sup></td><td>mil (10<sup>3</sup>)</td><td>Kilobyte</td><td>KB</td></tr>
+<tr><td>2<sup>20</sup></td><td>milhão (10<sup>6</sup>)</td><td>Megabyte</td><td>MB</td></tr>
+<tr><td>2<sup>30</sup></td><td>bilhão (10<sup>9</sup>)</td><td>Gigabyte</td><td>GB</td></tr>
+<tr><td>2<sup>40</sup></td><td>trilhão (10<sup>12</sup>)</td><td>Terabyte</td><td>TB</td></tr>
+<tr><td>2<sup>50</sup></td><td>quatrilhão (10<sup>15</sup>)</td><td>Petabyte</td><td>PB</td></tr>
+</table></div>
+<p>Tamanhos úteis: um caractere ASCII = 1 byte; <code>int64</code>/timestamp = 8 bytes; UUID = 16 bytes; um tweet de texto ≈ 300 bytes com metadados; uma foto comprimida ≈ 200 KB–2 MB; 1 minuto de vídeo HD ≈ 50–100 MB.</p>
+
+<h2 id="latencias">Latências que todo programador deve saber</h2>
+<p>Valores aproximados (ordem de grandeza é o que importa; os números originais são de Jeff Dean e Peter Norvig, com atualizações posteriores):</p>
+<div class="table-wrap"><table>
+<tr><th>Operação</th><th>Tempo</th><th>Para lembrar</th></tr>
+<tr><td>Referência ao cache L1</td><td>~1 ns</td><td></td></tr>
+<tr><td>Branch mispredict</td><td>~3 ns</td><td></td></tr>
+<tr><td>Referência ao cache L2</td><td>~4 ns</td><td></td></tr>
+<tr><td>Lock/unlock de mutex</td><td>~17 ns</td><td></td></tr>
+<tr><td>Referência à memória principal</td><td>~100 ns</td><td>RAM ≈ 100× L1</td></tr>
+<tr><td>Comprimir 1 KB (Zippy/Snappy)</td><td>~2 µs</td><td></td></tr>
+<tr><td>Enviar 2 KB numa rede de 10 Gbps</td><td>~1.6 µs</td><td></td></tr>
+<tr><td>Ler 1 MB sequencial da memória</td><td>~3 µs</td><td></td></tr>
+<tr><td>Leitura aleatória 4 KB em SSD</td><td>~16 µs</td><td></td></tr>
+<tr><td>Ler 1 MB sequencial de SSD</td><td>~50 µs</td><td></td></tr>
+<tr><td>Round trip no mesmo datacenter</td><td>~500 µs</td><td>0,5 ms</td></tr>
+<tr><td>Seek de disco (HDD)</td><td>~2–10 ms</td><td>evite seeks</td></tr>
+<tr><td>Ler 1 MB sequencial de HDD</td><td>~1 ms</td><td></td></tr>
+<tr><td>Pacote Califórnia → Holanda → Califórnia</td><td>~150 ms</td><td>a velocidade da luz é um limite</td></tr>
+</table></div>
+<div class="box tip"><strong class="t">Conclusões que você deve verbalizar</strong>
+<ul>
+<li>Memória é rápida, disco é lento: <strong>evite seeks</strong> e prefira leitura sequencial (é por isso que LSM trees e logs append-only existem).</li>
+<li>Algoritmos simples de compressão são rápidos: <strong>comprima antes de mandar pela rede</strong>.</li>
+<li>Round trips entre regiões custam ~100 ms: <strong>evite chamadas síncronas cross-region</strong> no caminho crítico.</li>
+<li>Uma chamada no mesmo DC é ~0,5 ms, então 10 chamadas sequenciais já são 5 ms. <strong>Paralelize e faça batch</strong>.</li>
+</ul></div>
+
+<h2 id="disponibilidade">Disponibilidade: os "noves"</h2>
+<div class="table-wrap"><table>
+<tr><th>Disponibilidade</th><th>Downtime por ano</th><th>Por mês</th><th>Por dia</th></tr>
+<tr><td>99% (dois noves)</td><td>3,65 dias</td><td>7,3 h</td><td>14,4 min</td></tr>
+<tr><td>99,9%</td><td>8,77 h</td><td>43,8 min</td><td>1,44 min</td></tr>
+<tr><td>99,99%</td><td>52,6 min</td><td>4,38 min</td><td>8,6 s</td></tr>
+<tr><td>99,999%</td><td>5,26 min</td><td>26,3 s</td><td>0,86 s</td></tr>
+</table></div>
+<p><strong>SLA</strong> é o acordo formal com o cliente (AWS EC2: 99,99%). <strong>SLO</strong> é a meta interna, e <strong>SLI</strong> é a métrica medida (por exemplo, % de requisições com sucesso abaixo de 300 ms).</p>
+<p><strong>Componentes em série multiplicam:</strong> API (99,9%) → banco (99,9%) = 99,8%. <strong>Componentes redundantes em paralelo</strong> melhoram: duas réplicas de 99% independentes dão 1 − 0,01² = 99,99%.</p>
+
+<h2 id="formulas">O kit de fórmulas</h2>
+<div class="table-wrap"><table>
+<tr><th>Grandeza</th><th>Fórmula</th></tr>
+<tr><td>Segundos por dia</td><td>86.400 ≈ <strong>10<sup>5</sup></strong> (arredonde sem medo)</td></tr>
+<tr><td>QPS médio</td><td>DAU × ações por usuário/dia ÷ 10<sup>5</sup></td></tr>
+<tr><td>QPS de pico</td><td>QPS médio × 2 a 3 (ou × 10 para eventos)</td></tr>
+<tr><td>Armazenamento</td><td>itens/dia × tamanho × dias de retenção × fator de replicação</td></tr>
+<tr><td>Banda</td><td>QPS × tamanho da resposta</td></tr>
+<tr><td>Cache (regra 80/20)</td><td>20% dos dados lidos por dia</td></tr>
+<tr><td>Servidores</td><td>QPS de pico ÷ QPS por servidor (um servidor web típico faz ~1–10 mil req/s simples)</td></tr>
+</table></div>
+<p>Referências de capacidade (ordens de grandeza): um PostgreSQL bem configurado faz alguns milhares a ~10–20 mil escritas simples/s; um Redis faz ~100 mil ops/s por nó; uma partição Kafka faz ~10 MB/s; uma conexão WebSocket ociosa custa alguns KB, então um servidor aguenta ~100 mil a 1 milhão de conexões.</p>
+
+<h2 id="exemplo-twitter">Exemplo resolvido: QPS e armazenamento de um "Twitter"</h2>
+<p><strong>Premissas</strong> (diga-as em voz alta e escreva):</p>
+<ul>
+<li>300 milhões de usuários ativos por mês; 50% usam diariamente, ou seja, <strong>150 M DAU</strong>.</li>
+<li>Cada usuário posta 2 tweets por dia em média.</li>
+<li>10% dos tweets têm mídia (média de 1 MB).</li>
+<li>Dados retidos por 5 anos.</li>
+</ul>
+<p><strong>QPS de escrita</strong> = 150 M × 2 / 10<sup>5</sup> ≈ <strong>3.000 tweets/s</strong>; o pico (2×) é <strong>~6.000/s</strong>.</p>
+<p><strong>Armazenamento de mídia</strong> = 150 M × 2 × 10% × 1 MB = 30 TB/dia; em 5 anos, 30 TB × 365 × 5 ≈ <strong>55 PB</strong> (antes da replicação).</p>
+<p><strong>Texto</strong>: id (8 B) + texto (140 B) + metadados (~100 B) ≈ 250 B; 300 M tweets/dia × 250 B = 75 GB/dia, ou ~137 TB em 5 anos. Comparado à mídia, é desprezível.</p>
+<div class="box interview"><strong class="t">O que fazer com o número</strong>
+O número só vale se mudar uma decisão. "São 55 PB de mídia, então ela vai para object storage (S3) com CDN, nunca para o banco. Os tweets de texto somam ~137 TB, o que é grande demais para um Postgres único; vou particionar ou usar um wide-column como Cassandra. E 6 mil escritas/s no pico cabem em poucos nós."</div>
+
+<h2 id="exemplo-leitura">Exemplo resolvido: leitura e cache</h2>
+<p>Se cada usuário lê o timeline 10 vezes por dia e cada timeline traz 20 tweets: 150 M × 10 / 10<sup>5</sup> = <strong>15.000 leituras de timeline/s</strong> (pico ~30 mil), e cada uma busca 20 tweets, ou seja, 300 mil leituras de tweet/s. Isso pede cache e timelines pré-computados (veja <a href="11-news-feed.html">News feed</a>).</p>
+<p>Cache para tweets "quentes" dos últimos 2 dias: 600 M tweets × 250 B = 150 GB. Cabe em poucos nós de Redis.</p>
+
+<h2 id="calculadora">Calculadora rápida</h2>
+<div class="card" id="calc">
+  <div class="filters">
+    <label>DAU <input id="c-dau" type="number" value="10000000"></label>
+    <label>Ações/usuário/dia <input id="c-act" type="number" value="10"></label>
+    <label>Bytes por item <input id="c-size" type="number" value="500"></label>
+    <label>Retenção (anos) <input id="c-years" type="number" value="5"></label>
+    <label>Réplicas <input id="c-rep" type="number" value="3"></label>
+    <label>Leituras por escrita <input id="c-rw" type="number" value="10"></label>
+  </div>
+  <div id="c-out"></div>
+</div>
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const fmt = (n) => n >= 1e15 ? (n/1e15).toFixed(1)+" PB" : n >= 1e12 ? (n/1e12).toFixed(1)+" TB" : n >= 1e9 ? (n/1e9).toFixed(1)+" GB" : n >= 1e6 ? (n/1e6).toFixed(1)+" MB" : (n/1e3).toFixed(1)+" KB";
+  const num = (n) => n.toLocaleString("pt-BR", { maximumFractionDigits: 0 });
+  function calc() {
+    const dau = +$("c-dau").value, act = +$("c-act").value, size = +$("c-size").value, years = +$("c-years").value, rep = +$("c-rep").value, rw = +$("c-rw").value;
+    const perDay = dau * act, wqps = perDay / 86400, rqps = wqps * rw;
+    const storage = perDay * size * 365 * years * rep;
+    $("c-out").innerHTML = `<div class="table-wrap"><table>
+      <tr><td>Escritas/dia</td><td><strong>${num(perDay)}</strong></td></tr>
+      <tr><td>QPS de escrita (médio / pico 2×)</td><td><strong>${num(wqps)}</strong> / ${num(wqps*2)}</td></tr>
+      <tr><td>QPS de leitura (médio / pico 2×)</td><td><strong>${num(rqps)}</strong> / ${num(rqps*2)}</td></tr>
+      <tr><td>Dados novos por dia</td><td>${fmt(perDay*size)}</td></tr>
+      <tr><td>Armazenamento total com réplicas</td><td><strong>${fmt(storage)}</strong></td></tr>
+      <tr><td>Cache 20% de 1 dia</td><td>${fmt(perDay*size*0.2)}</td></tr></table></div>`;
+  }
+  document.querySelectorAll("#calc input").forEach((i) => i.addEventListener("input", calc));
+  calc();
+})();
+</script>
+
+<h2 id="dicas">Dicas para a entrevista</h2>
+<ul>
+<li><strong>Arredonde agressivamente:</strong> 99.987 / 9,1 vira 100.000 / 10 = 10.000.</li>
+<li><strong>Escreva as premissas</strong> no quadro para consultar depois.</li>
+<li><strong>Rotule as unidades</strong>: "5" é 5 KB ou 5 MB?</li>
+<li><strong>Não gaste mais de 5 minutos.</strong> Muitos entrevistadores preferem pular a estimativa e só pedir números quando importarem; pergunte: "quer que eu faça estimativas agora ou conforme necessário?".</li>
+<li>Estimativas mais pedidas: QPS, QPS de pico, armazenamento, cache, número de servidores.</li>
+</ul>
+
+<h2 id="quiz">Quiz</h2>
+<div class="quiz" data-answer="1"><div class="q">10 M DAU, cada usuário faz 20 requisições por dia. QPS médio aproximado?</div>
+<button class="opt">~200</button><button class="opt">~2.000</button><button class="opt">~20.000</button><button class="opt">~200.000</button>
+<div class="why">10<sup>7</sup> × 20 / 10<sup>5</sup> = 2.000 req/s. O pico fica entre 4 e 6 mil.</div></div>
+<div class="quiz" data-answer="2"><div class="q">Quanto downtime por ano permite 99,99%?</div>
+<button class="opt">~8,7 horas</button><button class="opt">~5 minutos</button><button class="opt">~52 minutos</button><button class="opt">~3,6 dias</button>
+<div class="why">0,01% de 525.600 minutos ≈ 52,6 min.</div></div>
+<div class="quiz" data-answer="0"><div class="q">Qual operação é mais lenta?</div>
+<button class="opt">Round trip entre continentes</button><button class="opt">Seek em HDD</button><button class="opt">Ler 1 MB de SSD</button><button class="opt">Round trip no mesmo datacenter</button>
+<div class="why">~150 ms, contra ~10 ms do seek, ~50 µs do SSD e ~0,5 ms do round trip local.</div></div>
+<div class="quiz" data-answer="3"><div class="q">Um sistema chama 3 serviços em série, cada um com 99,9% de disponibilidade. A disponibilidade composta é cerca de:</div>
+<button class="opt">99,9%</button><button class="opt">99,99%</button><button class="opt">99%</button><button class="opt">99,7%</button>
+<div class="why">0,999³ ≈ 0,997. Dependências síncronas em série reduzem a disponibilidade.</div></div>
+
+<h2 id="recursos">Vídeos e leituras</h2>
+<ul class="links">
+<li class="read"><a href="https://gist.github.com/jboner/2841832" target="_blank" rel="noopener">Latency Numbers Every Programmer Should Know (gist)</a></li>
+<li class="read"><a href="https://colin-scott.github.io/personal_website/research/interactive_latency.html" target="_blank" rel="noopener">Latências interativas por ano</a><small>Mostra como os números evoluíram.</small></li>
+<li class="video"><a href="https://www.youtube.com/results?search_query=back+of+the+envelope+estimation+system+design+interview" target="_blank" rel="noopener">Vídeos: back-of-the-envelope estimation</a></li>
+<li class="read"><a href="https://sre.google/sre-book/availability-table/" target="_blank" rel="noopener">Google SRE Book: tabela de disponibilidade</a></li>
+<li class="read"><a href="https://www.hellointerview.com/learn/system-design/in-a-hurry/introduction" target="_blank" rel="noopener">Hello Interview: System Design in a Hurry</a><small>Inclui uma boa seção sobre quando estimar.</small></li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>

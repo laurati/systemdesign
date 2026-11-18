@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · De zero a milhões de usuários — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Capítulo 01 · Fundamentos</span>
+<h1>De zero a milhões de usuários</h1>
+<p class="lead">A evolução de uma arquitetura, passo a passo. Cada passo resolve o gargalo do anterior, e entender <em>qual gargalo</em> cada peça resolve é o vocabulário básico de toda entrevista de system design.</p>
+
+<div class="objectives">
+  <h4>Ao final você saberá:</h4>
+  <ul>
+    <li>Explicar o papel de DNS, load balancer, réplicas de banco, cache, CDN, filas e sharding.</li>
+    <li>Escolher entre SQL e NoSQL e entre escala vertical e horizontal, com justificativa.</li>
+    <li>Tornar a camada web <em>stateless</em> e entender por que isso habilita o autoscaling.</li>
+    <li>Descrever uma arquitetura multi-datacenter e seus desafios.</li>
+  </ul>
+</div>
+
+<h2 id="servidor-unico">Passo 0: um único servidor</h2>
+<p>Tudo começa numa máquina: app web, banco de dados e cache juntos. O fluxo de uma requisição:</p>
+<ol>
+  <li>O usuário digita <code>api.meusite.com</code>. O <strong>DNS</strong> (normalmente um serviço gerenciado como Route 53 ou Cloudflare) devolve o IP do servidor.</li>
+  <li>O navegador ou app envia HTTP para esse IP.</li>
+  <li>O servidor responde com HTML (site) ou JSON (API para apps móveis).</li>
+</ol>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  U[Usuário: web/mobile] -->|1. resolve domínio| DNS[(DNS)]
+  DNS -->|2. IP| U
+  U -->|3. HTTP| S["Servidor único: app + banco"]</pre>
+<figcaption>Bom para um MVP. Um ponto único de falha (SPOF) e um limite físico de CPU/RAM.</figcaption></figure>
+
+<h2 id="banco-separado">Passo 1: separar o banco de dados</h2>
+<p>Com mais usuários, separamos a camada web (tráfego) da camada de dados. Agora cada uma pode escalar de forma independente.</p>
+
+<h3>SQL (relacional) ou NoSQL?</h3>
+<div class="table-wrap"><table>
+<tr><th></th><th>Relacional (PostgreSQL, MySQL)</th><th>NoSQL (Cassandra, DynamoDB, MongoDB, Redis)</th></tr>
+<tr><td>Modelo</td><td>Tabelas, linhas, esquema fixo</td><td>Chave-valor, documento, coluna larga, grafo</td></tr>
+<tr><td>Joins / transações</td><td>Sim, ACID completo</td><td>Limitados ou inexistentes (geralmente por chave/partição)</td></tr>
+<tr><td>Escala de escrita</td><td>Vertical + réplicas; sharding é trabalhoso</td><td>Horizontal nativa (particionamento automático)</td></tr>
+<tr><td>Latência</td><td>Boa</td><td>Muito baixa e previsível no acesso por chave</td></tr>
+</table></div>
+<div class="box tip"><strong class="t">Regra prática para a entrevista</strong>
+Comece com <strong>relacional</strong>: é o padrão seguro e resolve 90% dos casos. Mude para NoSQL quando houver um motivo concreto: (1) latência muito baixa; (2) dados não estruturados ou sem relações; (3) só precisa serializar/deserializar (JSON, YAML); (4) volume massivo de escrita ou dados (TB/PB), por exemplo eventos, mensagens de chat ou métricas.</div>
+
+<h2 id="vertical-horizontal">Passo 2: escala vertical × horizontal</h2>
+<div class="procon">
+  <div class="pro"><h5>Vertical (scale up): máquina maior</h5><ul><li>Simples: zero mudança no código.</li><li>Ótima com pouco tráfego.</li><li>Mas tem limite físico, custo exponencial e nenhum failover: se cair, cai tudo.</li></ul></div>
+  <div class="con"><h5>Horizontal (scale out): mais máquinas</h5><ul><li>Escala quase ilimitada e redundância.</li><li>Exige load balancer, serviço stateless e dados particionados.</li><li>Mais complexidade operacional.</li></ul></div>
+</div>
+
+<h2 id="load-balancer">Passo 3: load balancer</h2>
+<p>O LB recebe todo o tráfego num <strong>IP público</strong> e o distribui entre servidores web, que agora só têm IPs privados (mais seguro). Se o servidor 1 cai, o tráfego vai para o 2; se o tráfego cresce, adicionamos o servidor 3.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  U[Usuários] --> LB[Load balancer: IP público]
+  LB --> W1[Web 1: IP privado]
+  LB --> W2[Web 2: IP privado]
+  W1 --> DB[(Banco)]
+  W2 --> DB</pre></figure>
+<ul>
+  <li><strong>Algoritmos:</strong> round robin, least connections, IP hash, weighted.</li>
+  <li><strong>L4 × L7:</strong> L4 (TCP/UDP) é rápido e não olha o conteúdo; L7 (HTTP) roteia por path/header, termina TLS e faz retries. Detalhes em <a href="ferramentas.html#load-balancer">Ferramentas</a>.</li>
+  <li><strong>Health checks</strong> tiram do pool os servidores doentes.</li>
+  <li>O próprio LB é redundante (par ativo-passivo ou serviço gerenciado como ALB/NLB).</li>
+</ul>
+
+<h2 id="replicacao">Passo 4: replicação do banco</h2>
+<p>O modelo mais comum é <strong>primário–réplicas</strong> (master–slave): só o primário aceita escritas, e as réplicas recebem cópias e atendem leituras. A maioria das aplicações tem muito mais leitura que escrita, então isso multiplica a capacidade.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  W[Servidores web] -->|escritas| P[(Primário)]
+  W -->|leituras| R1[(Réplica 1)]
+  W -->|leituras| R2[(Réplica 2)]
+  P -. replicação .-> R1
+  P -. replicação .-> R2</pre></figure>
+<ul>
+  <li><strong>Desempenho:</strong> leituras em paralelo entre réplicas.</li>
+  <li><strong>Confiabilidade:</strong> dados em várias máquinas, até em regiões diferentes.</li>
+  <li><strong>Disponibilidade:</strong> se uma réplica cai, as leituras vão para outra. Se o primário cai, uma réplica é <em>promovida</em> (failover).</li>
+</ul>
+<div class="box warn"><strong class="t">Cuidado com o atraso de replicação (replication lag)</strong>
+Replicação assíncrona significa que uma réplica pode estar alguns ms ou segundos atrasada. Exemplo clássico: o usuário edita o perfil, a página recarrega lendo de uma réplica e mostra o dado antigo. Soluções: <em>read-your-writes</em> (ler do primário por alguns segundos depois de uma escrita do próprio usuário), roteamento por sessão, ou replicação síncrona para dados críticos (mais lenta). No failover, a réplica promovida pode não ter as últimas escritas, e isso exige reconciliação.</div>
+
+<h2 id="cache">Passo 5: cache</h2>
+<p>Cache é armazenamento temporário em memória para dados lidos com frequência ou caros de calcular. Ler da RAM leva ~100 ns; ler do banco pela rede, alguns ms.</p>
+<p>Padrão mais comum, <strong>cache-aside</strong> (read-through feito pela aplicação): procura no cache; num miss, lê do banco e grava no cache.</p>
+<div class="code-title">go/cache/lru.go (trecho): LRU com TTL e cache-aside</div>
+<pre><code class="language-go" data-src="go/cache/lru.go" data-lines="81-92">// GetOrLoad implementa cache-aside. `load` é a ida ao banco.
+func (c *LRU[V]) GetOrLoad(key string, load func(string) (V, error)) (V, error) {
+	if v, ok := c.Get(key); ok {
+		return v, nil
+	}
+	v, err := load(key)
+	if err != nil {
+		return v, err
+	}
+	c.Set(key, v)
+	return v, nil
+}</code></pre>
+<h3>Considerações ao usar cache</h3>
+<div class="table-wrap"><table>
+<tr><th>Ponto</th><th>O que dizer na entrevista</th></tr>
+<tr><td>Quando usar</td><td>Dados lidos muito mais do que escritos. Cache é volátil: nunca é a fonte da verdade.</td></tr>
+<tr><td>Expiração (TTL)</td><td>Curta demais gera muitas idas ao banco; longa demais serve dado velho.</td></tr>
+<tr><td>Consistência</td><td>Banco e cache não são atualizados atomicamente. Prefira <em>invalidar</em> (delete) a atualizar o cache na escrita.</td></tr>
+<tr><td>Falhas</td><td>Um único nó de cache é SPOF. Use vários nós (Redis Cluster) e superdimensione a memória.</td></tr>
+<tr><td>Evicção</td><td>LRU (mais comum), LFU, FIFO.</td></tr>
+<tr><td>Thundering herd</td><td>Chave popular expira e mil requisições vão ao banco juntas. Mitigue com lock/single-flight, TTL com jitter e refresh antecipado.</td></tr>
+</table></div>
+<p>Outras estratégias (write-through, write-back, read-through) estão em <a href="ferramentas.html#cache">Ferramentas → Cache</a>.</p>
+
+<h2 id="cdn">Passo 6: CDN</h2>
+<p>Uma CDN é uma rede de servidores geograficamente distribuídos (edge/PoPs) que cacheia conteúdo estático (imagens, vídeos, CSS, JS) perto do usuário. Um usuário em Lisboa baixa a imagem de um PoP em Lisboa, não do servidor em São Paulo.</p>
+<ol>
+  <li>O usuário pede <code>cdn.site.com/logo.png</code>.</li>
+  <li>Se o PoP não tem o arquivo, busca na <em>origem</em> (servidor ou S3) e cacheia conforme o header <code>Cache-Control</code>/TTL.</li>
+  <li>Os próximos usuários da região recebem direto do PoP.</li>
+</ol>
+<p><strong>Considerações:</strong> custo (você paga por transferência, então não cacheie o que é pouco acessado), TTL adequado, fallback para a origem se a CDN falhar, invalidação (API da CDN ou <em>versionamento de URL</em>: <code>app.v42.js</code>).</p>
+
+<h2 id="stateless">Passo 7: camada web stateless</h2>
+<p>Se a sessão do usuário fica na memória do servidor A, toda requisição dele precisa ir ao A (<em>sticky sessions</em>), o que atrapalha o balanceamento e impede derrubar servidores. A solução é tirar o estado da camada web e colocá-lo num store compartilhado (Redis, DynamoDB, banco) ou num token assinado (JWT).</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  U[Usuários] --> LB[Load balancer]
+  LB --> W1[Web 1]
+  LB --> W2[Web 2]
+  LB --> W3[Web N: autoscaling]
+  W1 & W2 & W3 --> S[(Store de sessão: Redis/NoSQL)]</pre></figure>
+<p>Com servidores stateless, o <strong>autoscaling</strong> fica trivial: adicione ou remova servidores conforme CPU ou fila de requisições, sem perder sessões.</p>
+
+<h2 id="multi-dc">Passo 8: múltiplos data centers</h2>
+<p>Para disponibilidade e latência global, os usuários são roteados por <strong>GeoDNS</strong> para o data center mais próximo (por exemplo, 70% US-East, 30% EU-West). Se um DC cai, todo o tráfego vai para o outro.</p>
+<p><strong>Desafios técnicos:</strong></p>
+<ul>
+  <li><strong>Redirecionamento de tráfego:</strong> GeoDNS ou anycast.</li>
+  <li><strong>Sincronização de dados:</strong> cada região tem seu banco; num failover, o outro DC precisa ter os dados. Replicação assíncrona entre regiões (Netflix faz isso) traz consistência eventual e conflitos.</li>
+  <li><strong>Teste e deploy:</strong> automação para manter os DCs idênticos e testar a aplicação em várias regiões.</li>
+</ul>
+
+<h2 id="filas">Passo 9: fila de mensagens</h2>
+<p>Uma fila é um buffer durável que <strong>desacopla</strong> produtores e consumidores. O produtor publica e segue a vida; consumidores processam no seu ritmo. Exemplo: um upload de foto publica "processar foto" e workers aplicam filtros e geram miniaturas. Se a fila cresce, adicionamos workers; se esvazia, removemos.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  P1[Web: produtor] -->|publica| Q[[Fila]]
+  P2[Web: produtor] -->|publica| Q
+  Q -->|consome| C1[Worker]
+  Q -->|consome| C2[Worker]</pre></figure>
+<p>Benefícios: tolerância a picos, isolamento de falhas (o consumidor caiu? as mensagens esperam), escala independente, retries. Kafka × RabbitMQ × SQS está em <a href="ferramentas.html#filas">Ferramentas</a>.</p>
+
+<h2 id="observabilidade">Passo 10: logs, métricas e automação</h2>
+<ul>
+  <li><strong>Logs</strong> centralizados (ELK/Loki/CloudWatch) para investigar erros.</li>
+  <li><strong>Métricas</strong> de host (CPU, memória, disco), agregadas (latência do banco, hit rate do cache) e de negócio (DAU, retenção, receita).</li>
+  <li><strong>Tracing distribuído</strong> (OpenTelemetry) para seguir uma requisição entre serviços.</li>
+  <li><strong>CI/CD</strong> para builds, testes e deploys automatizados.</li>
+</ul>
+
+<h2 id="sharding">Passo 11: sharding do banco</h2>
+<p>Quando nem o maior servidor dá conta das escritas ou do volume de dados, dividimos o banco em <strong>shards</strong>: bancos com o mesmo esquema e dados diferentes. A <em>sharding key</em> decide onde cada linha mora, por exemplo <code>user_id % 4</code>.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart TB
+  A[App] -->|"hash(user_id) % 4"| R{Roteador}
+  R --> S0[(Shard 0)]
+  R --> S1[(Shard 1)]
+  R --> S2[(Shard 2)]
+  R --> S3[(Shard 3)]</pre></figure>
+<p>A escolha mais importante é a <strong>sharding key</strong>: ela deve distribuir os dados de maneira uniforme e permitir que a maioria das queries vá a um único shard.</p>
+<div class="table-wrap"><table>
+<tr><th>Problema</th><th>Explicação</th><th>Mitigação</th></tr>
+<tr><td>Resharding</td><td>Um shard enche ou cresce de modo desigual; <code>% N</code> muda quase tudo de lugar quando N muda.</td><td><a href="05-consistent-hashing.html">Consistent hashing</a> ou shards lógicos (muitas partições virtuais mapeadas a poucos nós).</td></tr>
+<tr><td>Celebridade (hotspot)</td><td>Um shard recebe tráfego desproporcional (o perfil de uma celebridade).</td><td>Shard dedicado, subparticionar a chave, cache.</td></tr>
+<tr><td>Joins e desnormalização</td><td>Joins entre shards são caros ou inviáveis.</td><td>Desnormalizar para responder por um único shard.</td></tr>
+<tr><td>Transações entre shards</td><td>Exigem 2PC ou sagas.</td><td>Modelar para que as transações fiquem em um shard.</td></tr>
+</table></div>
+
+<h2 id="final">A arquitetura final</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart TB
+  U[Usuários web/mobile] --> DNS[GeoDNS]
+  U --> CDN[CDN: estáticos]
+  DNS --> LB[Load balancer]
+  subgraph DC1[Data center 1]
+    LB --> W[Web servers stateless: autoscaling]
+    W --> C[(Cache: Redis)]
+    W --> DBP[(Banco sharded: primário + réplicas)]
+    W --> NS[(NoSQL: sessões, dados de alto volume)]
+    W --> Q[[Fila]] --> WK[Workers]
+  end
+  W -.-> OBS[Logs, métricas, alertas]
+  DBP -. replicação cross-region .-> DC2[(Data center 2)]</pre></figure>
+
+<div class="box note"><strong class="t">Resumo: como escalar para milhões de usuários</strong>
+<ul>
+  <li>Camada web stateless.</li>
+  <li>Redundância em todos os níveis.</li>
+  <li>Cache em tudo o que for possível.</li>
+  <li>Múltiplos data centers.</li>
+  <li>Estáticos na CDN.</li>
+  <li>Dados escalados por sharding.</li>
+  <li>Camadas divididas em serviços independentes.</li>
+  <li>Monitoramento e automação.</li>
+</ul></div>
+
+<h2 id="simulacao">Simulação: "Nosso app vai crescer 100×. O que você muda?"</h2>
+<div class="dialog">
+  <p class="i">Temos um app de receitas num único servidor com Postgres. Vamos aparecer num programa de TV e esperamos 100× mais tráfego em 3 semanas. Como você prepararia a arquitetura?</p>
+  <p class="c">Antes de propor algo, quero entender o perfil. Quantos usuários ativos hoje, e qual a proporção de leitura e escrita? Imagino que a maioria só veja receitas.</p>
+  <p class="i">Uns 20 mil DAU hoje. Sim, 95% é leitura de receitas e fotos; escritas são comentários e favoritos.</p>
+  <p class="c">Ótimo, então o problema é principalmente de leitura. Eu atacaria em ordem de impacto por esforço. Primeiro, fotos e assets estáticos numa CDN, com origem no S3: provavelmente é a maior parte dos bytes e sai do servidor de uma vez. Segundo, tornaria a aplicação stateless, com sessões no Redis ou JWT, e colocaria 2+ instâncias atrás de um load balancer com autoscaling. Isso também elimina o ponto único de falha.</p>
+  <p class="i">E o banco?</p>
+  <p class="c">Separado num serviço gerenciado com 1 primário e 2 réplicas de leitura. As páginas de receita, que são quase imutáveis, iriam para um cache Redis com TTL de alguns minutos via cache-aside. Com 95% de leitura, espero um hit rate acima de 90%, então o banco recebe uma fração pequena do tráfego.</p>
+  <p class="i">Um pico de TV é bem concentrado: todo mundo entra no mesmo minuto na mesma receita.</p>
+  <p class="c">Esse é o caso de thundering herd numa chave quente. Eu faria pré-aquecimento do cache com as receitas que vão aparecer no programa, e no código usaria single-flight para que só uma requisição recarregue a chave expirada. Também colocaria a própria página dessa receita em cache na CDN por 30–60 s. E faria um teste de carga simulando 100× antes do programa.</p>
+  <p class="i">Precisa de sharding?</p>
+  <p class="c">Não agora. 100× de 20 mil DAU são 2 milhões. Mesmo que cada usuário faça 10 escritas por dia, são ~230 escritas/s no pico, que um Postgres bem dimensionado aguenta tranquilamente. Sharding traz muita complexidade; eu só consideraria se os números de escrita ou o volume de dados pedissem.</p>
+  <p class="n">O que a entrevistadora quer ver: perguntas sobre o perfil de tráfego, priorização por impacto, números para justificar o que <em>não</em> fazer, e atenção a picos concentrados.</p>
+</div>
+
+<h2 id="quiz">Quiz</h2>
+<div class="quiz" data-answer="2"><div class="q">Por que tornar a camada web stateless?</div>
+<button class="opt">Para poder usar NoSQL</button><button class="opt">Para reduzir a latência do banco</button><button class="opt">Para que qualquer servidor atenda qualquer requisição, habilitando autoscaling e failover</button><button class="opt">Para não precisar de load balancer</button>
+<div class="why">Sem estado local, servidores viram peças intercambiáveis: dá para adicionar, remover ou perder um sem afetar sessões.</div></div>
+<div class="quiz" data-answer="1"><div class="q">Um usuário atualiza o perfil e, ao recarregar, vê o dado antigo. Causa mais provável?</div>
+<button class="opt">TTL da CDN</button><button class="opt">Leitura de uma réplica com atraso de replicação</button><button class="opt">Falha do load balancer</button><button class="opt">Sharding incorreto</button>
+<div class="why">Replicação assíncrona causa esse sintoma. A solução é read-your-writes: ler do primário logo após a própria escrita.</div></div>
+<div class="quiz" data-answer="3"><div class="q">Qual é o principal problema de usar <code>hash(key) % N</code> para escolher o shard?</div>
+<button class="opt">É lento</button><button class="opt">Não distribui uniformemente</button><button class="opt">Não funciona com strings</button><button class="opt">Ao mudar N, quase todas as chaves mudam de shard</button>
+<div class="why">De 4 para 5 shards, cerca de 80% das chaves mudam de lugar. Consistent hashing move só ~1/N.</div></div>
+<div class="quiz" data-answer="0"><div class="q">Quando um cache NÃO é uma boa ideia?</div>
+<button class="opt">Dados escritos com muito mais frequência do que lidos</button><button class="opt">Página inicial muito acessada</button><button class="opt">Perfil de usuário</button><button class="opt">Resultado de um cálculo caro e estável</button>
+<div class="why">Se o dado muda a cada leitura, o cache vive sendo invalidado: custo sem benefício.</div></div>
+
+<h2 id="recursos">Vídeos e leituras</h2>
+<ul class="links">
+  <li class="video"><a href="https://www.youtube.com/results?search_query=bytebytego+scale+from+zero+to+millions+of+users" target="_blank" rel="noopener">ByteByteGo: Scale from zero to millions of users</a><small>Busca no YouTube pelos vídeos do canal do autor do livro sobre este capítulo.</small></li>
+  <li class="video"><a href="https://www.youtube.com/watch?v=-W9F__D3oY4" target="_blank" rel="noopener">Harvard CS75: Scalability (David Malan)</a><small>Aula clássica sobre escala vertical/horizontal, cache, replicação e sharding.</small></li>
+  <li class="read"><a href="https://github.com/donnemartin/system-design-primer#how-to-approach-a-system-design-interview-question" target="_blank" rel="noopener">System Design Primer: escalabilidade</a></li>
+  <li class="read"><a href="https://aws.amazon.com/builders-library/" target="_blank" rel="noopener">Amazon Builders' Library</a><small>Artigos sobre caching, timeouts, retries e load shedding.</small></li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>

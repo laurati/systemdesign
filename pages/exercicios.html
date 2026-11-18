@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Exercícios — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/exercicios-data.js"></script>
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Prática</span>
+<h1>Exercícios</h1>
+<p class="lead">Mais de 100 exercícios que cobrem o que mais cai em entrevistas: estimativas, conceitos, escolha de ferramentas, trade-offs, mini-designs e código Go. Tente responder antes de abrir a solução.</p>
+
+<div class="box tip"><strong class="t">Como usar</strong>
+<ul>
+<li><strong>Estimativas:</strong> faça as contas no papel, em voz alta, em até 3 minutos cada.</li>
+<li><strong>Trade-offs:</strong> responda no formato "A ganha em…, perde em…; eu escolho quando…".</li>
+<li><strong>Mini-designs:</strong> 10–15 minutos cada: requisitos, alto nível e 1 deep dive. Para treino completo, use o <a href="simulacoes.html">simulador</a>.</li>
+<li><strong>Go:</strong> implemente antes de olhar o código da pasta <code>go/</code>; rode <code>go test</code>.</li>
+<li>Marque "resolvido" para acompanhar o progresso (salvo no navegador).</li>
+</ul></div>
+
+<h2 id="lista">Lista</h2>
+<div class="filters" id="cats"></div>
+<div class="filters" id="levels"></div>
+<div class="filters"><input type="search" id="q" placeholder="Buscar exercício…"><label><input type="checkbox" id="hide-solved"> Ocultar resolvidos</label><span id="count" style="color:var(--muted);font-size:14px"></span></div>
+<div id="ex-list"></div>
+
+</article>
+</main>
+<script>
+(function () {
+  const CATS = { all: "Todos", estimativa: "Estimativas", conceito: "Conceitos", ferramenta: "Qual ferramenta?", tradeoff: "Trade-offs", design: "Mini-designs", go: "Código Go" };
+  const LV = { all: "Todos os níveis", easy: "Fácil", medium: "Médio", hard: "Difícil" };
+  let cat = "all", lv = "all";
+  const key = "sdprep:ex";
+  const solved = () => { try { return JSON.parse(localStorage.getItem(key)) || {}; } catch { return {}; } };
+  const mk = (el, obj, cur, set) => {
+    el.innerHTML = Object.entries(obj).map(([k, v]) => `<button data-k="${k}" class="${k === cur ? "on" : ""}">${v}${obj === CATS && k !== "all" ? ` (${EXERCISES.filter((e) => e.cat === k).length})` : ""}</button>`).join("");
+    el.onclick = (e) => { if (e.target.dataset.k) { set(e.target.dataset.k); el.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b === e.target)); render(); } };
+  };
+  mk(document.getElementById("cats"), CATS, cat, (v) => (cat = v));
+  mk(document.getElementById("levels"), LV, lv, (v) => (lv = v));
+  document.getElementById("q").oninput = render;
+  document.getElementById("hide-solved").onchange = render;
+
+  function render() {
+    const s = solved();
+    const q = document.getElementById("q").value.toLowerCase();
+    const hide = document.getElementById("hide-solved").checked;
+    const items = EXERCISES.filter((e) => (cat === "all" || e.cat === cat) && (lv === "all" || e.level === lv) && (!q || e.q.toLowerCase().includes(q)) && !(hide && s[e.id]));
+    document.getElementById("count").textContent = `${items.length} exercícios · ${Object.keys(s).length}/${EXERCISES.length} resolvidos`;
+    document.getElementById("ex-list").innerHTML = items.map((e, i) => {
+      const body = e.opts
+        ? `<div class="quiz" data-answer="${e.answer}">${e.opts.map((o) => `<button class="opt">${o}</button>`).join("")}<div class="why">${e.sol}</div></div>`
+        : `${e.hint ? `<details><summary>Dica</summary><div class="body">${e.hint}</div></details>` : ""}<details><summary>Solução</summary><div class="body">${e.sol}</div></details>`;
+      return `<div class="ex ${s[e.id] ? "solved" : ""}">
+        <div class="meta">#${e.id} · ${CATS[e.cat]} · <span class="tag ${e.level}">${LV[e.level].toLowerCase()}</span></div>
+        <h4>${e.q}</h4>${body}
+        <label style="font-size:14px"><input type="checkbox" data-id="${e.id}" ${s[e.id] ? "checked" : ""}> resolvido</label></div>`;
+    }).join("");
+    document.querySelectorAll("#ex-list input[data-id]").forEach((c) => c.onchange = () => {
+      const st = solved(); if (c.checked) st[c.dataset.id] = true; else delete st[c.dataset.id];
+      localStorage.setItem(key, JSON.stringify(st)); c.closest(".ex").classList.toggle("solved", c.checked);
+      document.getElementById("count").textContent = `${document.querySelectorAll("#ex-list .ex").length} exercícios · ${Object.keys(st).length}/${EXERCISES.length} resolvidos`;
+    });
+    window.SD && SD.initQuizzes(document.getElementById("ex-list"));
+  }
+  render();
+  addEventListener("DOMContentLoaded", () => window.SD && SD.initQuizzes(document.getElementById("ex-list")));
+})();
+</script>
+</body>
+</html>

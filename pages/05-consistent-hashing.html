@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Consistent hashing — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Capítulo 05 · Estudo de caso</span>
+<h1>Projete consistent hashing</h1>
+<p class="lead">A técnica que permite adicionar ou remover servidores de um cluster movendo só uma pequena fração dos dados. Está por trás de Dynamo, Cassandra, CDNs, load balancers e caches distribuídos.</p>
+
+<div class="objectives"><h4>Ao final você saberá:</h4><ul>
+<li>Explicar por que <code>hash % N</code> falha quando o cluster muda.</li>
+<li>Desenhar o anel de hash e localizar o servidor de uma chave.</li>
+<li>Usar nós virtuais para equilibrar a carga.</li>
+<li>Implementar o anel em Go e medir quantas chaves se movem.</li>
+</ul></div>
+
+<h2 id="problema">O problema do rehash</h2>
+<p>Com N servidores de cache, a forma ingênua é <code>servidor = hash(chave) % N</code>. Funciona bem enquanto N é fixo. Mas se um servidor cai (N=4 → 3) ou entra um novo (4 → 5), <strong>quase todas as chaves mudam de servidor</strong>: uma tempestade de cache misses que derruba o banco.</p>
+<div class="table-wrap"><table>
+<tr><th>Chave</th><th>hash</th><th>% 4</th><th>% 3 (um servidor caiu)</th></tr>
+<tr><td>key0</td><td>18358617</td><td>1</td><td>0</td></tr>
+<tr><td>key1</td><td>26143584</td><td>0</td><td>0</td></tr>
+<tr><td>key2</td><td>18131146</td><td>2</td><td>1</td></tr>
+<tr><td>key3</td><td>35863496</td><td>0</td><td>2</td></tr>
+<tr><td>key4</td><td>34085809</td><td>1</td><td>1</td></tr>
+<tr><td>key5</td><td>27581703</td><td>3</td><td>0</td></tr>
+</table></div>
+<p>Nos testes Go deste site, ir de 4 para 5 servidores com módulo moveu <strong>~80%</strong> das chaves. Com consistent hashing, <strong>~19%</strong> (próximo do ideal de 1/5).</p>
+
+<h2 id="anel">O anel de hash</h2>
+<ol>
+<li>Pegue uma função de hash com espaço de saída grande (por exemplo, 0 a 2<sup>32</sup>−1, ou SHA-1 com 2<sup>160</sup>) e "dobre" esse espaço num <strong>anel</strong>.</li>
+<li>Aplique o hash ao <strong>identificador de cada servidor</strong> (IP ou nome) e posicione-o no anel.</li>
+<li>Aplique o hash a cada <strong>chave</strong> e posicione-a no anel.</li>
+<li>A chave pertence ao <strong>primeiro servidor encontrado andando no sentido horário</strong>.</li>
+</ol>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  subgraph Anel["Anel de hash (sentido horário)"]
+    direction LR
+    S0((s0)) --> K1[k1] --> S1((s1)) --> K2[k2] --> S2((s2)) --> K3[k3] --> S3((s3)) --> K0[k0] --> S0
+  end</pre>
+<figcaption>k0 → s0, k1 → s1, k2 → s2, k3 → s3. Cada chave vai para o próximo servidor no sentido horário.</figcaption></figure>
+<ul>
+<li><strong>Adicionar s4</strong> entre s3 e s0: só as chaves entre s3 e s4 (antes de s0) mudam, e vão para s4.</li>
+<li><strong>Remover s1:</strong> só as chaves entre s0 e s1 mudam, e vão para s2.</li>
+</ul>
+
+<h2 id="problemas">Dois problemas da abordagem básica</h2>
+<ol>
+<li><strong>Partições de tamanhos desiguais:</strong> com poucos servidores, o espaço entre eles no anel é aleatório. Um servidor pode ficar com 40% do anel e outro com 5%.</li>
+<li><strong>Distribuição desigual de chaves</strong>, e quando um servidor sai, toda a carga dele cai num único vizinho.</li>
+</ol>
+<p>Nos testes: com 1 posição por servidor e 4 servidores, um ficou com <strong>86</strong> chaves e outro com <strong>39.191</strong> (de 40 mil).</p>
+
+<h2 id="virtuais">Nós virtuais (vnodes)</h2>
+<p>Cada servidor físico aparece <strong>várias vezes</strong> no anel (s0#0, s0#1, …, s0#199). Cada servidor fica com muitos trechos pequenos espalhados.</p>
+<ul>
+<li>A distribuição fica uniforme: o desvio padrão cai de forma marcante com 100–200 vnodes (5–10% de desvio). Nos testes, com 200 vnodes: entre 9.313 e 11.036 chaves por servidor.</li>
+<li>Quando um servidor sai, a carga dele se espalha por <em>vários</em> vizinhos, não por um só.</li>
+<li><strong>Heterogeneidade:</strong> um servidor com o dobro de capacidade recebe o dobro de vnodes.</li>
+<li>Custo: mais memória para o índice (lista ordenada de posições) e um pouco mais de trabalho para rebalancear.</li>
+</ul>
+
+<h2 id="codigo">Implementação em Go</h2>
+<p>O anel é uma lista ordenada de posições; a busca usa <strong>busca binária</strong> (O(log V), em que V = total de vnodes), com wrap-around no fim.</p>
+<div class="code-title">go/consistenthash/ring.go</div>
+<pre><code class="language-go" data-src="go/consistenthash/ring.go">// Package consistenthash implementa um anel de hash consistente com nós virtuais.
+//
+// Ideia: servidores e chaves são mapeados para o mesmo espaço de hash (um anel
+// de 0 a 2^32-1). Uma chave pertence ao primeiro servidor encontrado andando
+// no sentido horário. Ao adicionar/remover um servidor, só as chaves do trecho
+// vizinho mudam de dono (~K/N chaves), em vez de quase todas (hash % N).
+package consistenthash
+
+import (
+	"hash/crc32"
+	"slices"
+	"strconv"
+	"sync"
+)
+
+type Ring struct {
+	mu       sync.RWMutex
+	replicas int               // nós virtuais por servidor
+	hashes   []uint32          // posições ordenadas no anel
+	owner    map[uint32]string // posição -&gt; servidor físico
+}
+
+// New cria um anel. Mais réplicas virtuais = distribuição mais uniforme
+// (desvio padrão menor), ao custo de mais memória para o índice.
+func New(replicas int) *Ring {
+	return &amp;Ring{replicas: replicas, owner: map[uint32]string{}}
+}
+
+func hashKey(s string) uint32 { return crc32.ChecksumIEEE([]byte(s)) }
+
+func (r *Ring) Add(servers ...string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range servers {
+		for i := 0; i &lt; r.replicas; i++ {
+			h := hashKey(s + "#" + strconv.Itoa(i))
+			r.owner[h] = s
+			r.hashes = append(r.hashes, h)
+		}
+	}
+	slices.Sort(r.hashes)
+}
+
+func (r *Ring) Remove(server string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := r.hashes[:0]
+	for _, h := range r.hashes {
+		if r.owner[h] == server {
+			delete(r.owner, h)
+			continue
+		}
+		kept = append(kept, h)
+	}
+	r.hashes = kept
+}
+
+// Get devolve o servidor responsável pela chave.
+func (r *Ring) Get(key string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.hashes) == 0 {
+		return ""
+	}
+	return r.owner[r.hashes[r.search(hashKey(key))]]
+}
+
+// GetN devolve os N primeiros servidores *distintos* no sentido horário —
+// é assim que Dynamo/Cassandra escolhem as réplicas de uma chave.
+func (r *Ring) GetN(key string, n int) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []string
+	seen := map[string]bool{}
+	start := r.search(hashKey(key))
+	for i := 0; i &lt; len(r.hashes) &amp;&amp; len(out) &lt; n; i++ {
+		s := r.owner[r.hashes[(start+i)%len(r.hashes)]]
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// search faz busca binária pela primeira posição &gt;= h (com wrap-around).
+func (r *Ring) search(h uint32) int {
+	i, _ := slices.BinarySearch(r.hashes, h)
+	if i == len(r.hashes) {
+		i = 0 // passou do fim: volta ao início do anel
+	}
+	return i
+}</code></pre>
+<div class="code-title">go/consistenthash/ring_test.go (trecho): medindo o remapeamento</div>
+<pre><code class="language-go" data-src="go/consistenthash/ring_test.go" data-lines="16-42">func TestMinimalRemapping(t *testing.T) {
+	r := New(200)
+	r.Add("s0", "s1", "s2", "s3")
+	ks := keys(20000)
+	before := map[string]string{}
+	for _, k := range ks {
+		before[k] = r.Get(k)
+	}
+
+	r.Add("s4")
+	moved := 0
+	for _, k := range ks {
+		now := r.Get(k)
+		if now != before[k] {
+			moved++
+			if now != "s4" {
+				t.Fatalf("chave %s mudou para %s — só deveria ir para o novo nó", k, now)
+			}
+		}
+	}
+	// Esperado ~1/5 das chaves. Com hash % N seriam ~80%.
+	frac := float64(moved) / float64(len(ks))
+	if frac &lt; 0.12 || frac &gt; 0.28 {
+		t.Fatalf("fração movida %.2f fora do esperado (~0.20)", frac)
+	}
+	t.Logf("adicionar 1 nó a 4 moveu %.1f%% das chaves", frac*100)
+}</code></pre>
+<pre><code class="language-text">$ go test ./consistenthash -v
+ring_test.go: adicionar 1 nó a 4 moveu 18.6% das chaves
+ring_test.go: com hash % N, ir de 4 para 5 servidores moveu 79.6% das chaves
+ring_test.go: replicas=1    min=86   max=39191
+ring_test.go: replicas=200  min=9313 max=11036</code></pre>
+
+<h2 id="replicas">Replicação no anel</h2>
+<p><code>GetN(key, 3)</code> anda no sentido horário e pega os <strong>3 primeiros servidores físicos distintos</strong>. É assim que Dynamo e Cassandra escolhem as réplicas (a "preference list"). Pular vnodes do mesmo servidor físico é essencial; em multi-DC, também se escolhem réplicas em racks/DCs diferentes.</p>
+
+<h2 id="onde">Onde é usado</h2>
+<ul>
+<li><strong>Amazon Dynamo / DynamoDB, Apache Cassandra:</strong> particionamento de dados.</li>
+<li><strong>Discord:</strong> distribuir guilds/conexões entre nós.</li>
+<li><strong>Akamai e outras CDNs:</strong> escolher o servidor de cache para uma URL.</li>
+<li><strong>Load balancers L4 (Google Maglev):</strong> afinidade de conexões com remapeamento mínimo.</li>
+<li><strong>Clientes de memcached (ketama):</strong> distribuição de chaves entre nós de cache.</li>
+</ul>
+
+<h2 id="alternativas">Alternativas que vale citar</h2>
+<div class="table-wrap"><table>
+<tr><th>Técnica</th><th>Ideia</th><th>Quando</th></tr>
+<tr><td><strong>Rendezvous (HRW) hashing</strong></td><td>Para cada chave, calcula hash(chave, servidor) para todos os servidores e escolhe o maior</td><td>Poucos servidores; simples, sem anel, distribuição ótima; O(N) por consulta</td></tr>
+<tr><td><strong>Jump consistent hash</strong> (Google)</td><td>Algoritmo de 5 linhas, sem memória, distribuição perfeita</td><td>Servidores numerados 0..N-1 que só crescem ou diminuem no fim (shards de storage)</td></tr>
+<tr><td><strong>Partições fixas</strong> (shards lógicos)</td><td>Cria, por exemplo, 4096 partições desde o início e mapeia partição → nó numa tabela</td><td>Kafka, Elasticsearch, Redis Cluster (16384 slots), Riak. Rebalancear = mover partições inteiras</td></tr>
+</table></div>
+<div class="box interview"><strong class="t">Frase para a entrevista</strong>
+"Para distribuir as chaves entre os nós de cache vou usar consistent hashing com ~150 nós virtuais por servidor. Assim, adicionar um nó move ~1/N das chaves e a carga fica equilibrada. Alternativamente, partições fixas, como os 16384 slots do Redis Cluster, dão o mesmo efeito com um mapa explícito."</div>
+
+<h2 id="simulacao">Simulação de entrevista</h2>
+<div class="dialog">
+<p class="i">Temos um cluster de cache com 20 nós e queremos crescer para 30 sem derrubar o banco. Como distribuir as chaves?</p>
+<p class="c">Se hoje for <code>hash % 20</code>, migrar para 30 invalidaria cerca de 2/3 do cache de uma vez e o banco receberia todas essas leituras. Eu usaria consistent hashing: cada nó com algumas centenas de vnodes num anel; a chave vai para o primeiro vnode no sentido horário.</p>
+<p class="i">E quanto do cache se perde ao adicionar os 10 nós?</p>
+<p class="c">Cerca de 10/30, um terço das chaves, que passa a pertencer aos nós novos. E dá para adicionar os nós um a um, com intervalo entre eles, para que o banco absorva ~3% de misses de cada vez. Também dá para fazer warm-up: os nós novos buscam no nó antigo antes de ir ao banco.</p>
+<p class="i">Por que vnodes?</p>
+<p class="c">Com uma posição por nó, os trechos do anel ficam de tamanhos aleatórios e alguns nós recebem várias vezes mais carga. Com vnodes, cada nó tem muitos trechos pequenos e a carga converge para a média. Também permitem dar mais vnodes a máquinas maiores, e quando um nó cai, sua carga se divide entre muitos vizinhos.</p>
+<p class="i">E uma chave muito quente?</p>
+<p class="c">Consistent hashing não resolve hot keys, só distribuição de chaves. Para uma chave quente eu replicaria em vários nós (sufixos <code>key#1..k</code> com leitura aleatória) ou usaria cache local na aplicação com TTL curto.</p>
+</div>
+
+<h2 id="quiz">Quiz</h2>
+<div class="quiz" data-answer="1"><div class="q">Com consistent hashing e N servidores, adicionar um servidor move aproximadamente:</div>
+<button class="opt">Todas as chaves</button><button class="opt">K/N das chaves</button><button class="opt">Metade das chaves</button><button class="opt">Nenhuma chave</button>
+<div class="why">Só as chaves do trecho do anel assumido pelo novo servidor.</div></div>
+<div class="quiz" data-answer="2"><div class="q">Para que servem os nós virtuais?</div>
+<button class="opt">Tornar o hash mais rápido</button><button class="opt">Eliminar hot keys</button><button class="opt">Equilibrar a distribuição e espalhar a carga quando um nó sai</button><button class="opt">Criptografar as chaves</button>
+<div class="why">Muitas posições por servidor deixam as partições de tamanho semelhante.</div></div>
+<div class="quiz" data-answer="0"><div class="q">Como encontrar o servidor de uma chave no anel de forma eficiente?</div>
+<button class="opt">Busca binária na lista ordenada de posições</button><button class="opt">Percorrer todos os servidores</button><button class="opt">Uma tabela hash simples</button><button class="opt">Consultar o ZooKeeper a cada requisição</button>
+<div class="why">O(log V), com wrap-around para o início quando passar do fim.</div></div>
+
+<h2 id="recursos">Vídeos e leituras</h2>
+<ul class="links">
+<li class="video"><a href="https://www.youtube.com/results?search_query=bytebytego+consistent+hashing" target="_blank" rel="noopener">ByteByteGo: Consistent hashing</a></li>
+<li class="video"><a href="https://www.youtube.com/results?search_query=gaurav+sen+consistent+hashing" target="_blank" rel="noopener">Gaurav Sen: Consistent hashing</a></li>
+<li class="read"><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf" target="_blank" rel="noopener">Paper do Dynamo (seção 4.2: particionamento)</a></li>
+<li class="read"><a href="https://arxiv.org/abs/1406.2294" target="_blank" rel="noopener">A Fast, Minimal Memory, Consistent Hash Algorithm (Jump hash)</a></li>
+<li class="read"><a href="https://research.google/pubs/maglev-a-fast-and-reliable-software-network-load-balancer/" target="_blank" rel="noopener">Google Maglev</a></li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>

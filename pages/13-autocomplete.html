@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Autocomplete de busca — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Capítulo 13 · Estudo de caso</span>
+<h1>Projete o autocomplete de uma busca</h1>
+<p class="lead">"Typeahead": a cada tecla, as 5 sugestões mais populares que começam com o que você digitou, em menos de 100 ms. O problema tem duas metades: servir rápido (trie) e manter os dados atualizados (pipeline).</p>
+
+<div class="objectives"><h4>Ao final você saberá:</h4><ul>
+<li>Estimar o tráfego gerado "a cada tecla".</li>
+<li>Usar uma trie com top-k cacheado em cada nó.</li>
+<li>Montar o pipeline de coleta e agregação de dados.</li>
+<li>Escalar a trie (sharding por prefixo) e otimizar com cache no navegador.</li>
+</ul></div>
+
+<h2 id="requisitos">Requisitos</h2>
+<div class="dialog">
+<p class="c">O casamento é só no início (prefixo) ou também no meio?</p><p class="i">Só no início.</p>
+<p class="c">Quantas sugestões?</p><p class="i">5.</p>
+<p class="c">Como escolher as 5?</p><p class="i">Por popularidade (frequência histórica de busca).</p>
+<p class="c">Corretor ortográfico?</p><p class="i">Não.</p>
+<p class="c">Idioma?</p><p class="i">Inglês; multilíngue se der tempo.</p>
+<p class="c">Maiúsculas e caracteres especiais?</p><p class="i">Tudo minúsculo e alfabético.</p>
+<p class="c">Escala?</p><p class="i">10 milhões de DAU.</p>
+</div>
+<ul><li><strong>Rapidez:</strong> menos de 100 ms (senão a experiência engasga).</li><li><strong>Relevância e ordenação</strong> por popularidade.</li><li><strong>Escalabilidade e alta disponibilidade.</strong></li></ul>
+
+<h2 id="estimativas">Estimativas</h2>
+<ul>
+<li>10 M DAU × 10 buscas/dia × 20 caracteres (uma requisição por tecla) = 2 bilhões de requisições/dia, ou <strong>~24.000 QPS</strong>; pico ~48.000.</li>
+<li>Se 20% das buscas são novas: 10 M × 10 × 20 B × 20% = <strong>0,4 GB/dia</strong> de dados novos.</li>
+</ul>
+
+<h2 id="alto-nivel">Alto nível</h2>
+<p><strong>Serviço de coleta</strong> (registra consultas e frequências) e <strong>serviço de consulta</strong> (devolve o top 5 de um prefixo). A versão ingênua, uma tabela <code>(query, frequency)</code> com</p>
+<pre><code class="language-sql">SELECT query FROM frequency_table WHERE query LIKE 'tw%' ORDER BY frequency DESC LIMIT 5;</code></pre>
+<p>funciona com pouco dado, mas é lenta em escala. Daí a trie.</p>
+
+<h2 id="trie">Deep dive: a trie</h2>
+<p>Árvore em que cada nó é um caractere; o caminho da raiz até um nó forma um prefixo. Cada nó terminal guarda a frequência da consulta completa.</p>
+<p>Busca ingênua de top-k: (1) achar o nó do prefixo, O(p); (2) percorrer a subárvore para achar todos os termos, O(c); (3) ordenar, O(c log c). Com prefixos curtos (uma letra), c é enorme.</p>
+<p><strong>Duas otimizações:</strong></p>
+<ol>
+<li><strong>Limitar o tamanho do prefixo:</strong> ninguém digita 200 caracteres; p ≤ 50 faz o passo 1 virar O(1).</li>
+<li><strong>Cachear o top-k em cada nó:</strong> cada nó guarda suas 5 consultas mais frequentes. A consulta vira O(1) (descer até o nó e ler a lista). O custo é memória extra, troca que vale muito a pena.</li>
+</ol>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart TD
+  R(("raiz: best, bet, bee, buy, win")) --> B(("b: best 35, bet 29, bee 20, buy 14"))
+  R --> W(("w: win 50, wish 25"))
+  B --> BE(("be: best 35, bet 29, bee 20"))
+  B --> BU(("bu: buy 14"))
+  BE --> BES(("bes: best 35"))
+  BE --> BET(("bet: bet 29"))
+  BE --> BEE(("bee: bee 20"))</pre>
+<figcaption>Cada nó carrega seu top-k. A consulta "be" lê direto a lista do nó.</figcaption></figure>
+<div class="code-title">go/autocomplete/trie.go</div>
+<pre><code class="language-go" data-src="go/autocomplete/trie.go">// Package autocomplete implementa uma trie com top-k pré-computado em cada nó.
+//
+// Busca ingênua: achar o nó do prefixo (O(p)) e percorrer toda a subárvore
+// para encontrar as k consultas mais frequentes — lento para prefixos curtos.
+// Otimização clássica: cada nó guarda os seus top-k. A consulta vira O(p),
+// em troca de mais memória e de uma reconstrução periódica (offline, ex.: semanal)
+// a partir dos logs agregados de busca.
+package autocomplete
+
+import (
+	"sort"
+	"strings"
+)
+
+type Suggestion struct {
+	Query string
+	Freq  int
+}
+
+type node struct {
+	children map[rune]*node
+	top      []Suggestion
+}
+
+type Trie struct {
+	root *node
+	k    int
+}
+
+func NewTrie(k int) *Trie { return &amp;Trie{root: &amp;node{children: map[rune]*node{}}, k: k} }
+
+// Build constrói a trie a partir de frequências agregadas (saída do job de analytics).
+func Build(freq map[string]int, k int) *Trie {
+	t := NewTrie(k)
+	for q, f := range freq {
+		t.insert(strings.ToLower(q), f)
+	}
+	return t
+}
+
+func (t *Trie) insert(q string, f int) {
+	s := Suggestion{q, f}
+	n := t.root
+	t.offer(n, s)
+	for _, r := range q {
+		child, ok := n.children[r]
+		if !ok {
+			child = &amp;node{children: map[rune]*node{}}
+			n.children[r] = child
+		}
+		n = child
+		t.offer(n, s)
+	}
+}
+
+// offer mantém em cada nó apenas os k melhores.
+func (t *Trie) offer(n *node, s Suggestion) {
+	n.top = append(n.top, s)
+	sort.Slice(n.top, func(i, j int) bool {
+		if n.top[i].Freq != n.top[j].Freq {
+			return n.top[i].Freq &gt; n.top[j].Freq
+		}
+		return n.top[i].Query &lt; n.top[j].Query
+	})
+	if len(n.top) &gt; t.k {
+		n.top = n.top[:t.k]
+	}
+}
+
+// Suggest é O(len(prefix)): desce até o nó e devolve o top-k cacheado.
+func (t *Trie) Suggest(prefix string) []Suggestion {
+	n := t.root
+	for _, r := range strings.ToLower(prefix) {
+		next, ok := n.children[r]
+		if !ok {
+			return nil
+		}
+		n = next
+	}
+	return n.top
+}</code></pre>
+
+<h2 id="pipeline">Deep dive: pipeline de coleta</h2>
+<p>Atualizar a trie a cada busca (bilhões por dia) seria lento e desnecessário: o top 5 muda pouco. Em vez disso:</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  L[Analytics logs: query, timestamp] --> AG[Agregadores: batch semanal ou stream] --> AD[(Dados agregados: query, freq por semana)]
+  AD --> WK[Workers: constroem a trie] --> TDB[(Trie DB: snapshot serializado)]
+  TDB --> TC[(Trie cache: memória distribuída)]
+  API[Serviço de consulta] --> TC</pre></figure>
+<ul>
+<li><strong>Logs</strong> crus, append-only, não indexados.</li>
+<li><strong>Agregação</strong> com periodicidade conforme o caso: Google pode precisar de tempo real (tendências), mas para muitos casos semanal basta.</li>
+<li><strong>Workers</strong> constroem a trie de forma assíncrona e salvam no <strong>Trie DB</strong>: (a) documento serializado (MongoDB) ou (b) KV com prefixo → top-k (cada nó vira uma linha), o que facilita o sharding.</li>
+<li><strong>Trie cache:</strong> a trie em memória distribuída, recarregada a cada snapshot semanal.</li>
+</ul>
+
+<h2 id="consulta">Serviço de consulta</h2>
+<ol>
+<li>Requisição chega ao LB e vai aos servidores de API.</li>
+<li>Busca no trie cache; num miss, busca no trie DB e repopula o cache.</li>
+</ol>
+<p><strong>Otimizações:</strong></p>
+<ul>
+<li><strong>AJAX</strong> sem recarregar a página.</li>
+<li><strong>Cache no navegador:</strong> as sugestões mudam pouco. O Google responde com <code>Cache-Control: private, max-age=3600</code>.</li>
+<li><strong>Debounce</strong> no cliente: só envia depois de ~100–150 ms sem digitar.</li>
+<li><strong>Amostragem de logs:</strong> registrar 1 de cada N buscas, porque a popularidade sobrevive à amostragem.</li>
+</ul>
+
+<h2 id="manutencao">Manutenção da trie</h2>
+<ul>
+<li><strong>Criar:</strong> pelos workers, a partir dos dados agregados.</li>
+<li><strong>Atualizar:</strong> reconstruir semanalmente e trocar a antiga (preferível), ou atualizar nós individuais, o que é lento porque o top-k dos ancestrais muda junto.</li>
+<li><strong>Remover sugestões:</strong> conteúdo ofensivo, violento ou perigoso. Uma <strong>camada de filtro</strong> na frente do cache remove na hora; a remoção física acontece no próximo rebuild.</li>
+</ul>
+
+<h2 id="escala">Escalando o armazenamento</h2>
+<p>Sharding pela primeira letra (26 shards), depois pela segunda (aa–ag, ah–an…). Problema: a distribuição é desigual, porque há muito mais palavras com "s" do que com "x". Solução: um <strong>shard map manager</strong> que usa os dados históricos para combinar prefixos em shards de tamanho parecido (por exemplo, "s" sozinho num shard e "u–z" juntos em outro).</p>
+
+<h2 id="extras">Fechamento e follow-ups</h2>
+<ul>
+<li><strong>Multilíngue:</strong> nós com caracteres Unicode.</li>
+<li><strong>Por país:</strong> tries diferentes por região, em CDNs.</li>
+<li><strong>Tendências em tempo real</strong> (um evento quebra a internet): a reconstrução semanal não serve. Use streaming (Kafka + Flink) com janelas e pesos maiores para buscas recentes, mantendo uma trie "quente" pequena mesclada com a principal.</li>
+<li><strong>Personalização:</strong> mesclar o top global com o histórico do próprio usuário (no cliente ou num serviço separado).</li>
+</ul>
+
+<h2 id="simulacao">Simulação de entrevista</h2>
+<div class="dialog">
+<p class="i">Seu autocomplete atualiza semanalmente. Um terremoto acontece agora e todo mundo busca "terremoto em…". O que acontece?</p>
+<p class="c">No design semanal, o termo novo só apareceria na próxima reconstrução, o que é inaceitável para tendências. Eu adicionaria um caminho de tempo real: um consumidor de stream sobre os logs de busca conta as consultas em janelas de 5–10 minutos e mantém um top-k por prefixo para os termos em alta. O serviço de consulta mescla duas fontes: a trie histórica e esse índice de tendências, com o score da tendência ponderado por recência.</p>
+<p class="i">Contar todas as consultas em tempo real não fica caro?</p>
+<p class="c">Para heavy hitters não preciso de contagem exata: Count-Min Sketch + heap de top-k por janela, com memória fixa. Também amostro os logs. A precisão perdida é irrelevante para ranquear sugestões.</p>
+<p class="i">E como evitar que algo ofensivo vire tendência?</p>
+<p class="c">A camada de filtro na frente da resposta aplica uma blocklist com atualização imediata, e termos em alta passam por um classificador antes de entrar no índice de tendências. Há também um botão de remoção manual para casos urgentes.</p>
+</div>
+
+<h2 id="quiz">Quiz</h2>
+<div class="quiz" data-answer="3"><div class="q">O que torna a consulta de top-k O(1) na trie?</div>
+<button class="opt">Usar um hash map</button><button class="opt">Ordenar a subárvore</button><button class="opt">BFS na subárvore</button><button class="opt">Limitar o prefixo e guardar o top-k em cada nó</button>
+<div class="why">Descer até o nó é limitado pelo tamanho do prefixo; a resposta já está pronta no nó.</div></div>
+<div class="quiz" data-answer="1"><div class="q">Por que não atualizar a trie a cada busca?</div>
+<button class="opt">Tries não podem ser alteradas</button><button class="opt">Bilhões de escritas por dia, e o top-k muda pouco; reconstruir periodicamente é mais barato</button><button class="opt">Porque o cache é imutável</button><button class="opt">Por segurança</button>
+<div class="why">Separe o caminho de escrita (pipeline batch/stream) do de leitura (cache em memória).</div></div>
+<div class="quiz" data-answer="0"><div class="q">Por que sharding por primeira letra é problemático?</div>
+<button class="opt">Distribuição desigual: muitas palavras com "s", poucas com "x"</button><button class="opt">Só há 26 letras</button><button class="opt">Não funciona com cache</button><button class="opt">Impede o top-k</button>
+<div class="why">Daí o shard map manager baseado em dados históricos.</div></div>
+
+<h2 id="recursos">Vídeos e leituras</h2>
+<ul class="links">
+<li class="read"><a href="https://medium.com/@prefixyteam/how-we-built-prefixy-a-scalable-prefix-search-service-for-powering-autocomplete-c20f98e2eff1" target="_blank" rel="noopener">Prefixy: a scalable prefix search service</a></li>
+<li class="read"><a href="https://www.linkedin.com/blog/engineering/open-source/open-sourcing-typeaheadjs-the-library-that-powers-twitters-typeahead" target="_blank" rel="noopener">Typeahead em produção (LinkedIn/Twitter)</a></li>
+<li class="video"><a href="https://www.youtube.com/results?search_query=design+search+autocomplete+typeahead+system+design" target="_blank" rel="noopener">Vídeos: Design typeahead / autocomplete</a></li>
+<li class="read"><a href="https://en.wikipedia.org/wiki/Count%E2%80%93min_sketch" target="_blank" rel="noopener">Count-Min Sketch</a></li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>

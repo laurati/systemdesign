@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossário — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Referência</span>
+<h1>Glossário</h1>
+<p class="lead">Termos que aparecem nas entrevistas, em ordem alfabética. Use o filtro.</p>
+<div class="filters"><input type="search" id="gq" placeholder="Filtrar termos…" style="min-width:260px"></div>
+
+<div class="table-wrap"><table id="gloss">
+<tr><th>Termo</th><th>Definição</th></tr>
+<tr><td>ACID</td><td>Atomicidade, Consistência, Isolamento, Durabilidade: garantias de transações em bancos relacionais.</td></tr>
+<tr><td>Adaptive bitrate (ABR)</td><td>Streaming em segmentos com várias qualidades; o player troca conforme a banda (HLS, DASH).</td></tr>
+<tr><td>Anti-entropy</td><td>Processo de background que sincroniza réplicas divergentes (geralmente com Merkle trees).</td></tr>
+<tr><td>API gateway</td><td>Porta de entrada única: autenticação, rate limiting, roteamento, métricas.</td></tr>
+<tr><td>At-least-once / at-most-once / exactly-once</td><td>Semânticas de entrega: pode duplicar / pode perder / nem um nem outro (na prática: at-least-once + idempotência).</td></tr>
+<tr><td>Backpressure</td><td>Mecanismo para o consumidor sinalizar ao produtor que desacelere.</td></tr>
+<tr><td>Base62</td><td>Codificação com [0-9a-zA-Z]; usada em códigos curtos.</td></tr>
+<tr><td>Bloom filter</td><td>Estrutura probabilística: "certamente não está" ou "talvez esteja".</td></tr>
+<tr><td>CAP</td><td>Durante uma partição de rede, escolha entre consistência e disponibilidade.</td></tr>
+<tr><td>Cache-aside</td><td>A aplicação lê do cache; num miss, lê do banco e popula o cache.</td></tr>
+<tr><td>CDC (Change Data Capture)</td><td>Capturar mudanças do banco (pelo log de replicação) e publicá-las como eventos (Debezium).</td></tr>
+<tr><td>CDN</td><td>Rede de servidores de borda que cacheia conteúdo perto dos usuários.</td></tr>
+<tr><td>Circuit breaker</td><td>Interrompe chamadas a uma dependência que está falhando, falhando rápido.</td></tr>
+<tr><td>Consistent hashing</td><td>Mapeia chaves e nós num anel; mudar nós move ~1/N das chaves.</td></tr>
+<tr><td>Count-Min Sketch</td><td>Estrutura probabilística para contar frequências com memória fixa (superestima).</td></tr>
+<tr><td>CQRS</td><td>Separar o modelo de escrita do modelo de leitura.</td></tr>
+<tr><td>CRDT</td><td>Tipos de dados que convergem automaticamente sem coordenação.</td></tr>
+<tr><td>DAG</td><td>Grafo acíclico direcionado; usado para pipelines de tarefas com dependências.</td></tr>
+<tr><td>DAU / MAU</td><td>Usuários ativos diários / mensais.</td></tr>
+<tr><td>Dead-letter queue (DLQ)</td><td>Fila para mensagens que falharam repetidamente.</td></tr>
+<tr><td>Delta sync</td><td>Sincronizar só as partes (blocos) alteradas de um arquivo.</td></tr>
+<tr><td>Denormalização</td><td>Duplicar dados para evitar joins e acelerar leituras.</td></tr>
+<tr><td>Event sourcing</td><td>Estado derivado de um log imutável de eventos.</td></tr>
+<tr><td>Eventual consistency</td><td>Sem novas escritas, as réplicas convergem com o tempo.</td></tr>
+<tr><td>Failover</td><td>Troca automática para um componente reserva quando o principal falha.</td></tr>
+<tr><td>Fanout on write / on read</td><td>Distribuir o conteúdo na escrita (push) ou montar na leitura (pull).</td></tr>
+<tr><td>Fencing token</td><td>Número crescente associado a um lease; o storage rejeita tokens antigos.</td></tr>
+<tr><td>Geohash</td><td>Codifica latitude/longitude numa string; prefixos comuns indicam proximidade.</td></tr>
+<tr><td>GeoDNS</td><td>DNS que responde com IPs diferentes conforme a localização do cliente.</td></tr>
+<tr><td>Gossip</td><td>Protocolo em que nós trocam estado com vizinhos aleatórios; a informação se espalha em O(log N).</td></tr>
+<tr><td>GOP</td><td>Group of Pictures: bloco de quadros de vídeo que pode ser decodificado independentemente.</td></tr>
+<tr><td>gRPC</td><td>RPC sobre HTTP/2 com Protocol Buffers.</td></tr>
+<tr><td>Hinted handoff</td><td>Outro nó guarda escritas de uma réplica fora do ar e as entrega quando ela volta.</td></tr>
+<tr><td>Hot key / hotspot</td><td>Chave ou partição que recebe tráfego desproporcional.</td></tr>
+<tr><td>HyperLogLog</td><td>Estrutura para contar elementos distintos aproximadamente com poucos KB.</td></tr>
+<tr><td>Idempotência</td><td>Repetir a operação tem o mesmo efeito que executá-la uma vez.</td></tr>
+<tr><td>Jitter</td><td>Aleatoriedade adicionada a intervalos (retries, TTL) para evitar sincronização.</td></tr>
+<tr><td>Leaky / leaking bucket</td><td>Rate limiting com fila de tamanho fixo processada a taxa constante.</td></tr>
+<tr><td>Lease</td><td>Permissão com prazo (por exemplo, liderança) que precisa ser renovada.</td></tr>
+<tr><td>Linearizabilidade</td><td>Consistência mais forte: o sistema se comporta como uma única cópia.</td></tr>
+<tr><td>Load shedding</td><td>Rejeitar tráfego quando sobrecarregado para evitar colapso.</td></tr>
+<tr><td>Long polling</td><td>Cliente segura a requisição aberta até haver novidade ou timeout.</td></tr>
+<tr><td>LSM tree</td><td>Estrutura de storage com memtable + SSTables imutáveis + compaction; escrita rápida.</td></tr>
+<tr><td>Merkle tree</td><td>Árvore de hashes para comparar grandes conjuntos de dados eficientemente.</td></tr>
+<tr><td>Multipart upload</td><td>Upload de arquivo grande em partes paralelas e retomáveis.</td></tr>
+<tr><td>Outbox</td><td>Tabela de eventos gravada na mesma transação dos dados, publicada depois.</td></tr>
+<tr><td>p99</td><td>Percentil 99: 99% das requisições são mais rápidas que esse valor.</td></tr>
+<tr><td>PACELC</td><td>Extensão do CAP: sem partição, troca entre latência e consistência.</td></tr>
+<tr><td>Presigned URL</td><td>URL temporária assinada que permite upload/download direto no object storage.</td></tr>
+<tr><td>Quadtree</td><td>Árvore que divide o espaço 2D em quadrantes, adaptando-se à densidade.</td></tr>
+<tr><td>Quórum (N, W, R)</td><td>Réplicas, confirmações de escrita e de leitura; W+R&gt;N garante sobreposição.</td></tr>
+<tr><td>Raft / Paxos</td><td>Algoritmos de consenso; toleram f falhas com 2f+1 nós.</td></tr>
+<tr><td>Rate limiting</td><td>Limitar requisições por cliente num intervalo.</td></tr>
+<tr><td>Read repair</td><td>Na leitura, atualizar réplicas que tinham versões antigas.</td></tr>
+<tr><td>Replication lag</td><td>Atraso entre a escrita no primário e sua chegada às réplicas.</td></tr>
+<tr><td>Saga</td><td>Sequência de transações locais com ações compensatórias.</td></tr>
+<tr><td>Sharding</td><td>Dividir dados entre bancos com o mesmo esquema.</td></tr>
+<tr><td>SLA / SLO / SLI</td><td>Acordo com o cliente / meta interna / métrica medida.</td></tr>
+<tr><td>Sloppy quorum</td><td>Quórum que aceita nós saudáveis fora da lista preferencial.</td></tr>
+<tr><td>Snowflake</td><td>Gerador de IDs de 64 bits: timestamp + datacenter + máquina + sequência.</td></tr>
+<tr><td>SPOF</td><td>Single point of failure: ponto único de falha.</td></tr>
+<tr><td>SSE</td><td>Server-Sent Events: stream unidirecional servidor → cliente sobre HTTP.</td></tr>
+<tr><td>SSTable</td><td>Sorted String Table: arquivo imutável ordenado por chave.</td></tr>
+<tr><td>Stateless</td><td>Servidor que não guarda estado de sessão entre requisições.</td></tr>
+<tr><td>Sticky session</td><td>LB envia sempre o mesmo cliente ao mesmo servidor.</td></tr>
+<tr><td>Thundering herd</td><td>Muitas requisições simultâneas a um recurso (por exemplo, quando um cache expira).</td></tr>
+<tr><td>Token bucket</td><td>Rate limiting com balde de tokens reposto a taxa fixa; permite rajadas.</td></tr>
+<tr><td>Trie</td><td>Árvore de prefixos; base do autocomplete.</td></tr>
+<tr><td>TTL</td><td>Time to live: prazo de validade de um dado em cache.</td></tr>
+<tr><td>Vector clock</td><td>Lista de contadores por nó que detecta escritas concorrentes.</td></tr>
+<tr><td>Vnode</td><td>Nó virtual: várias posições de um servidor no anel de hash.</td></tr>
+<tr><td>Watermark</td><td>Em stream processing, estimativa de "até que tempo os eventos já chegaram".</td></tr>
+<tr><td>WebSocket</td><td>Conexão bidirecional persistente sobre TCP, iniciada via HTTP.</td></tr>
+<tr><td>Write-behind / write-through</td><td>Cache grava no banco depois (assíncrono) / junto (síncrono).</td></tr>
+</table></div>
+<script>
+document.getElementById("gq").addEventListener("input", (e) => {
+  const q = e.target.value.toLowerCase();
+  document.querySelectorAll("#gloss tr").forEach((tr, i) => { if (i) tr.hidden = q && !tr.textContent.toLowerCase().includes(q); });
+});
+</script>
+
+</article>
+</main>
+</body>
+</html>

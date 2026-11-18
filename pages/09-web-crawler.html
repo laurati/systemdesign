@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Web crawler — System Design na Prática</title>
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/site.js" defer></script>
+</head>
+<body data-root="..">
+<main>
+<article class="content">
+
+<span class="kicker">Capítulo 09 · Estudo de caso</span>
+<h1>Projete um web crawler</h1>
+<p class="lead">Baixar bilhões de páginas, extrair links e repetir, sem derrubar sites alheios, sem baixar a mesma coisa duas vezes e sem cair em armadilhas.</p>
+
+<div class="objectives"><h4>Ao final você saberá:</h4><ul>
+<li>Desenhar os componentes de um crawler e o fluxo entre eles.</li>
+<li>Projetar o URL frontier com prioridade e politeness.</li>
+<li>Deduplicar URLs e conteúdo em escala (Bloom filter, checksums).</li>
+<li>Lidar com robots.txt, armadilhas, falhas e escala distribuída.</li>
+</ul></div>
+
+<h2 id="usos">Para que serve um crawler</h2>
+<ul>
+<li><strong>Indexação de buscadores</strong> (Googlebot).</li>
+<li><strong>Arquivamento</strong> (Internet Archive).</li>
+<li><strong>Mineração de dados</strong> (análise de mercado, preços).</li>
+<li><strong>Monitoramento</strong> (violação de direitos autorais).</li>
+<li>Hoje, também <strong>coleta de dados para treinar LLMs</strong>.</li>
+</ul>
+
+<h2 id="requisitos">Requisitos</h2>
+<div class="dialog">
+<p class="c">Qual o propósito?</p><p class="i">Indexação para um buscador.</p>
+<p class="c">Quantas páginas por mês?</p><p class="i">1 bilhão.</p>
+<p class="c">Que tipo de conteúdo? Só HTML?</p><p class="i">Só HTML.</p>
+<p class="c">Considerar páginas novas e editadas?</p><p class="i">Sim.</p>
+<p class="c">Guardar as páginas?</p><p class="i">Sim, por até 5 anos.</p>
+<p class="c">Conteúdo duplicado?</p><p class="i">Ignorar.</p>
+</div>
+<p>Características desejadas: <strong>escalabilidade</strong> (paralelismo), <strong>robustez</strong> (HTML malformado, servidores que não respondem, armadilhas), <strong>politeness</strong> (não sobrecarregar sites) e <strong>extensibilidade</strong> (novos tipos de conteúdo no futuro).</p>
+
+<h2 id="estimativas">Estimativas</h2>
+<ul>
+<li>1 bilhão de páginas/mês ÷ (30 × 10<sup>5</sup> s) ≈ <strong>400 páginas/s</strong>; pico ~800/s.</li>
+<li>Página média de 500 KB, então 1 bi × 500 KB = <strong>500 TB/mês</strong>, e em 5 anos <strong>30 PB</strong>.</li>
+</ul>
+
+<h2 id="alto-nivel">Design de alto nível</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  SEED[Seed URLs] --> F[URL frontier]
+  F --> D[HTML downloader]
+  D <--> DNS[DNS resolver + cache]
+  D --> P[Content parser]
+  P --> SEEN{Conteúdo já visto?}
+  SEEN -->|sim| X[Descarta]
+  SEEN -->|não| CS[(Content storage: S3)]
+  SEEN -->|não| LE[Link extractor]
+  LE --> UF[URL filter: extensões, blocklist]
+  UF --> US{URL já vista?}
+  US -->|não| F
+  US -->|não| USTORE[(URL storage)]
+  US -->|sim| X2[Descarta]</pre></figure>
+<div class="table-wrap"><table>
+<tr><th>Componente</th><th>Papel</th></tr>
+<tr><td>Seed URLs</td><td>Ponto de partida, escolhido por domínio, país ou popularidade</td></tr>
+<tr><td>URL frontier</td><td>Fila de URLs a baixar (prioridade + politeness), o coração do sistema</td></tr>
+<tr><td>HTML downloader</td><td>Baixa as páginas, respeitando robots.txt</td></tr>
+<tr><td>DNS resolver</td><td>DNS é lento (10–200 ms) e síncrono em muitas bibliotecas, então use cache próprio</td></tr>
+<tr><td>Content parser</td><td>Valida e faz parse do HTML; separado para não travar o download</td></tr>
+<tr><td>"Content seen?"</td><td>Detecta páginas duplicadas (~30% da web) comparando hashes</td></tr>
+<tr><td>Content storage</td><td>Páginas em disco/object storage; as populares também em memória</td></tr>
+<tr><td>URL extractor / filter</td><td>Extrai links, converte relativos em absolutos, filtra extensões, blocklist</td></tr>
+<tr><td>"URL seen?" + URL storage</td><td>Evita reprocessar URLs (Bloom filter ou hash table)</td></tr>
+</table></div>
+
+<h2 id="bfs">DFS × BFS</h2>
+<p>A web é um grafo direcionado. DFS mergulha fundo demais. <strong>BFS</strong> (fila FIFO) é o padrão, mas tem dois problemas: (1) a maioria dos links de uma página aponta para o <em>mesmo host</em>, então a BFS pura martela um servidor (impolido); (2) não há prioridade, e nem toda página tem a mesma importância. O URL frontier resolve os dois.</p>
+
+<h2 id="frontier">Deep dive: o URL frontier</h2>
+<h3>Politeness</h3>
+<p>Uma única conexão por host de cada vez, com um intervalo entre downloads. Implementação: <strong>uma fila por host</strong> (back queues), e cada worker consome de uma fila de cada vez. Um mapa host → fila decide onde cada URL entra.</p>
+<h3>Prioridade</h3>
+<p>Um <strong>prioritizer</strong> pontua as URLs (PageRank, tráfego, frequência de atualização) e as coloca em <strong>front queues</strong> por prioridade; um seletor escolhe as filas de maior prioridade com mais probabilidade.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart TB
+  IN[URLs] --> PR[Prioritizer]
+  PR --> F1[Front queue: alta] & F2[Front queue: média] & F3[Front queue: baixa]
+  F1 & F2 & F3 --> FS[Seletor com viés para prioridade]
+  FS --> R[Roteador: mapa host → fila]
+  R --> B1[Back queue: a.com] & B2[Back queue: b.com] & B3[Back queue: c.com]
+  B1 & B2 & B3 --> HS["Seletor: heap pelo próximo horário livre do host"]
+  HS --> W1[Worker 1] & W2[Worker 2]</pre></figure>
+<h3>Freshness e armazenamento</h3>
+<ul>
+<li>Recrawl com base no histórico de mudanças da página; páginas importantes com mais frequência.</li>
+<li>O frontier tem centenas de milhões de URLs: não cabe em memória. A maior parte fica em disco, com buffers em memória para enfileirar e desenfileirar e escrita em lote.</li>
+</ul>
+<div class="code-title">go/crawler/frontier.go: prioridade por host, politeness com min-heap e dedup</div>
+<pre><code class="language-go" data-src="go/crawler/frontier.go">// Package crawler implementa o "URL frontier" de um web crawler:
+// a estrutura que decide QUAL URL baixar a seguir respeitando
+//
+//   - prioridade (páginas importantes primeiro — front queues);
+//   - politeness (no máximo 1 requisição por host a cada `delay` — back queues);
+//   - deduplicação (não baixar a mesma URL duas vezes).
+package crawler
+
+import (
+	"container/heap"
+	"net/url"
+	"sync"
+	"time"
+)
+
+type Frontier struct {
+	mu      sync.Mutex
+	delay   time.Duration
+	now     func() time.Time
+	seen    map[string]bool     // em produção: Bloom filter ou store de hashes
+	perHost map[string][]queued // back queue por host (FIFO por prioridade)
+	ready   hostHeap            // min-heap: próximo instante em que cada host pode ser visitado
+	inHeap  map[string]bool
+}
+
+type queued struct {
+	url      string
+	priority int // maior = mais importante (PageRank, frequência de atualização…)
+}
+
+func NewFrontier(delay time.Duration, now func() time.Time) *Frontier {
+	if now == nil {
+		now = time.Now
+	}
+	return &amp;Frontier{delay: delay, now: now, seen: map[string]bool{}, perHost: map[string][]queued{}, inHeap: map[string]bool{}}
+}
+
+// Add normaliza e enfileira a URL se ainda não foi vista.
+func (f *Frontier) Add(raw string, priority int) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" &amp;&amp; u.Scheme != "https") {
+		return false
+	}
+	u.Fragment = "" // #secao aponta para a mesma página
+	norm := u.String()
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.seen[norm] {
+		return false
+	}
+	f.seen[norm] = true
+
+	q := append(f.perHost[u.Host], queued{norm, priority})
+	// Inserção ordenada por prioridade dentro do host (estável).
+	for i := len(q) - 1; i &gt; 0 &amp;&amp; q[i].priority &gt; q[i-1].priority; i-- {
+		q[i], q[i-1] = q[i-1], q[i]
+	}
+	f.perHost[u.Host] = q
+	if !f.inHeap[u.Host] {
+		heap.Push(&amp;f.ready, hostSlot{host: u.Host, at: f.now()})
+		f.inHeap[u.Host] = true
+	}
+	return true
+}
+
+// Next devolve a próxima URL que pode ser baixada agora, ou "" se nenhum
+// host está liberado (o worker deve esperar).
+func (f *Frontier) Next() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ready.Len() == 0 || f.ready[0].at.After(f.now()) {
+		return ""
+	}
+	slot := heap.Pop(&amp;f.ready).(hostSlot)
+	q := f.perHost[slot.host]
+	next := q[0]
+	f.perHost[slot.host] = q[1:]
+	if len(q) &gt; 1 {
+		heap.Push(&amp;f.ready, hostSlot{host: slot.host, at: f.now().Add(f.delay)})
+	} else {
+		delete(f.inHeap, slot.host)
+	}
+	return next.url
+}
+
+type hostSlot struct {
+	host string
+	at   time.Time
+}
+
+type hostHeap []hostSlot
+
+func (h hostHeap) Len() int           { return len(h) }
+func (h hostHeap) Less(i, j int) bool { return h[i].at.Before(h[j].at) }
+func (h hostHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *hostHeap) Push(x any)        { *h = append(*h, x.(hostSlot)) }
+func (h *hostHeap) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
+}</code></pre>
+
+<h2 id="downloader">Deep dive: o downloader</h2>
+<ul>
+<li><strong>robots.txt</strong> (Robots Exclusion Protocol): baixe-o por domínio, <em>cacheie</em> e respeite <code>Disallow</code> e <code>Crawl-delay</code>.</li>
+<li><strong>Crawl distribuído:</strong> muitos servidores, cada um com muitas threads; particione as URLs por host (hash do host → worker), para que a politeness seja local.</li>
+<li><strong>Cache de DNS</strong> atualizado por cron.</li>
+<li><strong>Localidade:</strong> crawlers perto dos sites (por região).</li>
+<li><strong>Timeouts curtos:</strong> servidores lentos não podem prender workers.</li>
+</ul>
+
+<h2 id="robustez">Robustez</h2>
+<ul>
+<li><strong>Consistent hashing</strong> para distribuir carga entre downloaders e permitir adicionar ou remover servidores.</li>
+<li><strong>Salvar o estado</strong> do crawl (frontier, URLs vistas) periodicamente para retomar após falhas.</li>
+<li><strong>Tratamento de exceções:</strong> um erro não pode derrubar o sistema; registre e siga.</li>
+<li><strong>Validação de dados</strong> para evitar erros de parsing.</li>
+</ul>
+
+<h2 id="dedup">Deduplicação</h2>
+<p><strong>URLs vistas:</strong> 1 bilhão/mês e dezenas de bilhões no total. Um set exato custaria terabytes. Um <strong>Bloom filter</strong> com 1% de falso positivo usa ~9,6 bits por URL (~1,2 GB por bilhão). O falso positivo significa só "deixei de baixar 1% de URLs novas", o que é aceitável.</p>
+<div class="code-title">go/bloom/bloom.go (trecho): dimensionamento</div>
+<pre><code class="language-go" data-src="go/bloom/bloom.go" data-lines="21-30">// New dimensiona o filtro para n itens com taxa de falso positivo p:
+//
+//	m = -n·ln(p) / (ln 2)²     k = (m/n)·ln 2
+//
+// Ex.: 1 bilhão de URLs com p=1% ≈ 9,6 bits/item ≈ 1,2 GB — cabe em memória.
+func New(n int, p float64) *Filter {
+	m := uint64(math.Ceil(-float64(n) * math.Log(p) / (math.Ln2 * math.Ln2)))
+	k := uint64(math.Round(float64(m) / float64(n) * math.Ln2))
+	return &amp;Filter{bits: make([]uint64, (m+63)/64), m: m, k: max(k, 1)}
+}</code></pre>
+<p><strong>Conteúdo duplicado:</strong> comparar páginas caractere a caractere é lento. Compare <strong>hashes</strong> (checksum do conteúdo). Para quase duplicatas (mesma página com data diferente), use <strong>SimHash/MinHash</strong>.</p>
+
+<h2 id="armadilhas">Conteúdo problemático</h2>
+<ul>
+<li><strong>Spider traps:</strong> URLs infinitas, como <code>site.com/foo/bar/foo/bar/…</code> ou calendários com "próximo mês" para sempre. Limite o tamanho da URL e a profundidade por host; detecte padrões manualmente e mantenha uma blocklist.</li>
+<li><strong>Dados sem valor:</strong> anúncios, código, spam: filtre.</li>
+<li><strong>Renderização de JavaScript:</strong> SPAs geram links dinamicamente; renderize num headless browser (caro, então use só onde necessário).</li>
+</ul>
+
+<h2 id="simulacao">Simulação de entrevista</h2>
+<div class="dialog">
+<p class="i">Seu crawler está fazendo 500 requisições/s em um único site pequeno, e o dono reclamou. O que aconteceu e como evitar?</p>
+<p class="c">É falta de politeness. Na BFS pura, uma página de um site traz dezenas de links do mesmo site, e vários workers os baixam em paralelo. A correção estrutural é o frontier com uma back queue por host: todas as URLs de um host vão para a mesma fila, só um worker consome dela de cada vez, e há um intervalo mínimo entre requisições (o <code>Crawl-delay</code> do robots.txt ou um padrão de 1 s). Um heap ordenado pelo "próximo horário permitido" de cada host diz aos workers qual fila está liberada.</p>
+<p class="i">Com milhões de hosts, como você distribui isso entre 100 máquinas?</p>
+<p class="c">Particiono por host: <code>hash(host)</code> com consistent hashing escolhe a máquina responsável. Assim, a politeness de um host fica inteiramente numa máquina e não preciso de coordenação global. Quando o link extractor encontra uma URL de outro host, ela é enviada para a máquina dona, via fila particionada pela mesma chave, como um tópico Kafka com chave = host.</p>
+<p class="i">E como evitar baixar a mesma URL duas vezes entre as máquinas?</p>
+<p class="c">Como cada host tem um único dono, o "URL seen?" também pode ser local por partição: um Bloom filter por máquina para os hosts que ela possui, mais um store persistente de URLs para checkpoints. Normalizo a URL antes (minúsculas no host, remoção de fragmentos e de parâmetros de tracking) para que variações não pareçam URLs diferentes.</p>
+</div>
+
+<h2 id="quiz">Quiz</h2>
+<div class="quiz" data-answer="1"><div class="q">Por que BFS pura é problemática?</div>
+<button class="opt">É lenta demais</button><button class="opt">Concentra requisições no mesmo host e não tem prioridade</button><button class="opt">Não encontra páginas novas</button><button class="opt">Usa recursão profunda</button>
+<div class="why">Links de uma página costumam apontar para o mesmo site.</div></div>
+<div class="quiz" data-answer="3"><div class="q">Melhor estrutura para "já vi esta URL?" em 10 bilhões de URLs?</div>
+<button class="opt">Lista</button><button class="opt">Tabela no Postgres sem índice</button><button class="opt">Árvore em memória com todas as URLs</button><button class="opt">Bloom filter</button>
+<div class="why">Poucos bits por item; os falsos positivos custam pouco nesse caso.</div></div>
+<div class="quiz" data-answer="0"><div class="q">Como lidar com spider traps?</div>
+<button class="opt">Limitar tamanho da URL e profundidade por host, e manter blocklists</button><button class="opt">Aumentar o número de workers</button><button class="opt">Usar DFS</button><button class="opt">Ignorar robots.txt</button>
+<div class="why">Não há solução perfeita; limites e detecção manual são o padrão.</div></div>
+
+<h2 id="recursos">Vídeos e leituras</h2>
+<ul class="links">
+<li class="read"><a href="https://www.cs.cornell.edu/courses/cs685/2002fa/mercator.pdf" target="_blank" rel="noopener">Mercator: A Scalable, Extensible Web Crawler</a><small>Origem do design de front/back queues.</small></li>
+<li class="read"><a href="https://nlp.stanford.edu/IR-book/html/htmledition/web-crawling-and-indexes-1.html" target="_blank" rel="noopener">Introduction to Information Retrieval: Web crawling</a></li>
+<li class="read"><a href="https://www.hellointerview.com/learn/system-design/problem-breakdowns/web-crawler" target="_blank" rel="noopener">Hello Interview: Web crawler</a></li>
+<li class="video"><a href="https://www.youtube.com/results?search_query=design+web+crawler+system+design+interview" target="_blank" rel="noopener">Vídeos: Design a web crawler</a></li>
+</ul>
+
+</article>
+</main>
+</body>
+</html>
