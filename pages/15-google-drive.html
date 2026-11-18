@@ -22,6 +22,20 @@
 <li>Tratar conflitos de sincronização e garantir consistência dos metadados.</li>
 </ul></div>
 
+<h2 id="conceitos">Conceitos deste capítulo</h2>
+<div class="table-wrap"><table>
+<tr><th>Conceito</th><th>Definição</th></tr>
+<tr><td>Namespace</td><td>A pasta raiz de um usuário; cada arquivo é identificado pelo namespace + caminho relativo.</td></tr>
+<tr><td>Bloco (chunk)</td><td>Pedaço de um arquivo (até alguns MB) que é a unidade de envio, armazenamento e deduplicação.</td></tr>
+<tr><td>Block server</td><td>Servidor que divide arquivos em blocos, comprime, cifra e envia ao armazenamento.</td></tr>
+<tr><td>Delta sync</td><td>Enviar só os blocos que mudaram, não o arquivo inteiro.</td></tr>
+<tr><td>Deduplicação</td><td>Guardar uma única vez blocos de conteúdo idêntico, identificados pelo hash.</td></tr>
+<tr><td>Metadados</td><td>Informações sobre os arquivos (nome, versão, lista de blocos, dono), separadas do conteúdo.</td></tr>
+<tr><td>Conflito de sincronização</td><td>Duas edições feitas sobre a mesma versão base; o sistema aceita uma e preserva a outra como cópia.</td></tr>
+<tr><td>Cold storage</td><td>Armazenamento barato e lento para dados raramente acessados (por exemplo, S3 Glacier).</td></tr>
+<tr><td>Long polling</td><td>Requisição que fica aberta até haver novidade; usada aqui para avisar o cliente de mudanças.</td></tr>
+</table></div>
+
 <h2 id="requisitos">Requisitos</h2>
 <div class="dialog">
 <p class="c">Funcionalidades mais importantes?</p><p class="i">Upload, download, sincronização e notificações.</p>
@@ -43,6 +57,7 @@
 <li>2 uploads/dia de 500 KB em média; leitura:escrita de 1:1.</li>
 <li>QPS de upload: 10 M × 2 / 10<sup>5</sup> ≈ <strong>240</strong>; pico ~480.</li>
 </ul>
+<p><strong>O que isso implica:</strong> o volume de requisições é baixo; o difícil é o armazenamento e a correção. 500 PB "alocados" não são 500 PB usados (a maioria dos usuários usa uma fração da cota), mas mesmo uma fração disso exige object storage com replicação, deduplicação e camadas frias. E, como perder um arquivo é inaceitável, o design precisa garantir que os metadados e os blocos nunca fiquem inconsistentes entre si.</p>
 
 <h2 id="evolucao">Evolução do design</h2>
 <p><strong>Servidor único:</strong> Apache + MySQL + diretório <code>drive/namespace/arquivo</code>. Logo o disco enche.</p>
@@ -53,6 +68,20 @@
 <li><strong>Metadados</strong> (usuários, arquivos, blocos, versões) num banco separado, replicado e sharded.</li>
 </ol>
 
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  subgraph V1["1. Um servidor"]
+    A1[Web + banco + disco local] --> D1["/drive/user1/foto.png"]
+  end
+  subgraph V2["2. Disco cheio: sharding"]
+    A2[App] -->|"user_id % 4"| SH1[(Disco 1)] & SH2[(Disco 2)] & SH3[(Disco 3)] & SH4[(Disco 4)]
+  end
+  subgraph V3["3. Object storage + metadados separados"]
+    LB[Load balancer] --> W[Web servers]
+    W --> MDB[(Metadados: banco)]
+    W --> S3[(S3 replicado entre regiões)]
+  end
+  V1 --> V2 --> V3</pre>
+<figcaption>Evolução: guardar arquivos no próprio servidor não escala nem é durável; o conteúdo vai para object storage e os metadados para um banco.</figcaption></figure>
 <h2 id="alto-nivel">Arquitetura final</h2>
 <figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
   CL[Cliente: desktop, mobile, web] -->|blocos| BS[Block servers: split, compressão, criptografia]
@@ -141,6 +170,30 @@ blocks_test.go: arquivo de 40970 bytes: enviados 2 de 11 blocos</code></pre>
 <div class="box tip"><strong class="t">Bônus: chunking por conteúdo (CDC)</strong>
 Com blocos de tamanho fixo, inserir um byte no início desloca todos os blocos seguintes e todos os hashes mudam. <em>Content-defined chunking</em> (rolling hash, como Rabin fingerprint) define as fronteiras pelo conteúdo, então uma inserção afeta só os blocos vizinhos. Muito usado em backup (restic, borg).</div>
 
+<h3>Chunking por conteúdo, em detalhe</h3>
+<p>Imagine um arquivo de 40 MB dividido em blocos fixos de 4 MB, e alguém insere 1 byte no começo. Todos os bytes se deslocam uma posição, o conteúdo de <em>todos</em> os 10 blocos muda, e o cliente reenvia o arquivo inteiro. Com content-defined chunking:</p>
+<ol>
+  <li>Uma janela de, digamos, 48 bytes desliza pelo arquivo, e a cada posição calcula-se um <em>rolling hash</em> da janela (barato de atualizar: tira o byte que saiu, soma o que entrou).</li>
+  <li>Quando o hash satisfaz uma condição (por exemplo, os últimos 22 bits são zero, o que acontece em média a cada 4 MB), essa posição vira uma fronteira de bloco.</li>
+  <li>As fronteiras dependem só dos bytes locais. Depois da inserção, a janela volta a ver as mesmas sequências de bytes e encontra as mesmas fronteiras de antes; só o primeiro bloco muda.</li>
+</ol>
+<p>Os blocos passam a ter tamanho variável (com limites mínimo e máximo para evitar extremos), em troca de uma deduplicação muito melhor.</p>
+
+<h3>O cuidado de segurança da deduplicação</h3>
+<p>Com dedup global, o cliente diz "tenho o bloco com hash X" e, se o servidor já tem X, nem precisa enviá-lo. Isso abre um ataque: quem souber o hash de um arquivo alheio pode "anunciar" que o possui e depois baixá-lo. Além disso, o fato de um upload ser instantâneo revela que alguém já tinha aquele conteúdo. Mitigações: deduplicar só dentro da mesma conta, ou exigir que o cliente prove ter o conteúdo (por exemplo, respondendo ao hash de trechos aleatórios escolhidos pelo servidor).</p>
+
+<h3>Limpando blocos que ninguém usa</h3>
+<p>Quando um arquivo é apagado ou uma versão antiga expira, seus blocos não podem simplesmente ser apagados: outros arquivos podem referenciar os mesmos hashes. O padrão é <strong>contagem de referências</strong> por bloco (incrementada quando uma versão passa a usá-lo, decrementada quando deixa de usar) e um coletor de lixo assíncrono que apaga blocos com contagem zero há mais de alguns dias. O atraso protege contra condições de corrida (um upload em andamento que vai referenciar o bloco).</p>
+
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  F[Arquivo] --> SPLIT[Divide em blocos]
+  SPLIT --> CMP[Comprime cada bloco]
+  CMP --> ENC[Cifra]
+  ENC --> UP[Envia ao storage]
+  subgraph Delta["Delta sync: arquivo editado"]
+    B1[bloco 1 ✓] --- B2["bloco 2 ✎ mudou"] --- B3[bloco 3 ✓] --- B4["bloco 4 ✎ mudou"]
+  end
+  B2 & B4 -->|"só estes são enviados"| UP</pre></figure>
 <h2 id="consistencia">Deep dive: alta consistência</h2>
 <p>Usuários diferentes não podem ver versões diferentes do mesmo arquivo ao mesmo tempo. Os <strong>metadados</strong> exigem consistência forte: um relacional com ACID (a escolha natural) ou um NoSQL com transações. O cache de metadados precisa ser invalidado na escrita, e réplicas de cache e banco devem estar consistentes.</p>
 <pre><code class="language-sql">users(user_id, name, email, ...)
@@ -174,12 +227,83 @@ device(device_id, user_id, last_logged_in)</code></pre>
   end</pre></figure>
 <p><strong>Download:</strong> o cliente é notificado (ou consulta ao reconectar), pede os metadados atualizados, descobre quais blocos faltam e baixa só esses dos block servers, montando o arquivo localmente.</p>
 
+<h3>Como o cliente descobre o que mudou</h3>
+<p>A notificação diz apenas "algo mudou na sua conta". Os detalhes vêm de uma API de mudanças baseada em <strong>cursor</strong>, no mesmo espírito do <code>cur_max_message_id</code> do chat:</p>
+<pre><code class="language-http">GET /v1/changes?cursor=c_8812            → 200 { changes: [
+     { path: "/docs/plano.txt", version: 9, blocks: ["a1f…","7c2…"] },
+     { path: "/fotos/velha.jpg", deleted: true } ],
+   cursor: "c_8815", has_more: false }</code></pre>
+<p>O servidor mantém um log de mudanças por conta (ou por pasta compartilhada), em ordem. O cursor é a posição nesse log. Um cliente que ficou offline por uma semana pede as mudanças desde seu último cursor e recebe exatamente o que perdeu, sem precisar comparar a árvore inteira. Isso torna a notificação apenas uma otimização: se ela se perder, o próximo poll pelo cursor recupera tudo.</p>
+
+<h3>O motor de sincronização no cliente</h3>
+<p>O cliente desktop é a parte mais difícil do sistema, porque precisa reconciliar três visões do mesmo arquivo:</p>
+<ul>
+  <li><strong>Local:</strong> o que está no disco agora (o cliente observa eventos do sistema de arquivos).</li>
+  <li><strong>Remota:</strong> o que o servidor diz que é a versão atual.</li>
+  <li><strong>Base:</strong> a última versão que os dois concordaram, guardada num banco local do cliente.</li>
+</ul>
+<div class="table-wrap"><table>
+<tr><th>Local vs base</th><th>Remota vs base</th><th>Ação</th></tr>
+<tr><td>igual</td><td>igual</td><td>nada</td></tr>
+<tr><td>mudou</td><td>igual</td><td>enviar (upload dos blocos novos)</td></tr>
+<tr><td>igual</td><td>mudou</td><td>baixar</td></tr>
+<tr><td>mudou</td><td>mudou</td><td><strong>conflito</strong>: manter as duas versões</td></tr>
+</table></div>
+<p>Sem a base, não dá para distinguir "eu apaguei este arquivo" de "ele foi criado no servidor e eu ainda não baixei". Essa comparação a três é o que o Dropbox descreve ao explicar a reescrita do seu motor de sincronização (link abaixo).</p>
+
+<figure class="mermaid-wrap"><pre class="mermaid">erDiagram
+  USER ||--o{ DEVICE : tem
+  USER ||--o{ WORKSPACE : possui
+  WORKSPACE ||--o{ FILE : contém
+  FILE ||--o{ FILE_VERSION : "histórico"
+  FILE_VERSION ||--o{ BLOCK : "lista ordenada"
+  USER { bigint user_id string email }
+  DEVICE { string device_id timestamp last_logged_in }
+  WORKSPACE { bigint id bool is_shared }
+  FILE { bigint id string relative_path int latest_version string checksum }
+  FILE_VERSION { bigint file_id int version_number string device_id }
+  BLOCK { string block_hash int block_order }</pre>
+<figcaption>Metadados: o conteúdo nunca está aqui, só a descrição de quais blocos formam cada versão.</figcaption></figure>
+<figure class="mermaid-wrap"><pre class="mermaid">sequenceDiagram
+  participant N as Notification service
+  participant C2 as Cliente 2
+  participant API as API servers
+  participant BS as Block servers
+  N-->>C2: houve mudanças (resposta do long poll)
+  C2->>API: GET mudanças desde meu cursor
+  API-->>C2: arquivo X, versão 9, blocos [a1, 7c, f3]
+  C2->>C2: compara com os blocos locais: falta 7c
+  C2->>BS: baixa o bloco 7c
+  BS-->>C2: bloco 7c
+  C2->>C2: monta o arquivo localmente
+  C2->>N: novo long poll</pre>
+<figcaption>Download: o cliente baixa só os blocos que não tem.</figcaption></figure>
 <h2 id="notificacao">Serviço de notificação: long polling × WebSocket</h2>
 <p>O Dropbox usa <strong>long polling</strong>, e faz sentido: a comunicação é unidirecional (servidor avisa "há mudanças"), as notificações são pouco frequentes e não há rajadas de dados. WebSocket seria mais adequado para comunicação bidirecional e em tempo real, como chat. Ao receber a resposta (ou timeout), o cliente busca as mudanças nos metadados e abre um novo long poll.</p>
 
 <h2 id="conflitos">Conflitos de sincronização</h2>
 <p>Dois usuários (ou dispositivos) editam o mesmo arquivo ao mesmo tempo. Estratégia: <strong>a primeira versão processada vence</strong>; a outra recebe um conflito. O cliente fica com as duas cópias (<code>arquivo.txt</code> e <code>arquivo (cópia em conflito de Ana).txt</code>) e o usuário escolhe como mesclar.</p>
 <p>A detecção usa a <strong>versão base</strong>: o cliente envia "minha edição parte da versão 7"; se o servidor já está na versão 8, há conflito. É lock otimista com <code>UPDATE file SET latest_version = 8 WHERE id = ? AND latest_version = 7</code>.</p>
+
+<figure class="mermaid-wrap"><pre class="mermaid">sequenceDiagram
+  participant U1 as Usuário 1
+  participant S as Servidor (versão 7)
+  participant U2 as Usuário 2
+  U1->>S: edição sobre a versão 7
+  S-->>U1: ok: agora versão 8
+  U2->>S: edição sobre a versão 7
+  S-->>U2: conflito: o servidor está na 8
+  U2->>U2: guarda "arquivo (cópia em conflito)" e baixa a versão 8</pre></figure>
+<h2 id="compartilhamento">Compartilhamento e permissões</h2>
+<ul>
+  <li>Uma tabela de permissões <code>(resource_id, principal, role)</code>, em que o recurso é um arquivo ou uma pasta, o principal é um usuário, grupo ou "qualquer pessoa com o link", e o papel é leitor, comentador ou editor.</li>
+  <li>Permissões de pasta são <strong>herdadas</strong>: verificar o acesso a um arquivo significa subir pela árvore de pastas até achar uma permissão. Para não percorrer a árvore a cada acesso, cacheia-se a lista efetiva de quem pode acessar cada pasta e invalida-se quando as permissões mudam.</li>
+  <li>Links públicos usam um token aleatório longo, revogável.</li>
+  <li>Quando algo é compartilhado com você, a pasta aparece no seu Drive e as mudanças nela entram no seu log de mudanças: o compartilhamento é, para a sincronização, só mais uma fonte de eventos.</li>
+</ul>
+
+<h2 id="criptografia">Criptografia em repouso</h2>
+<p>O padrão é a <strong>criptografia em envelope</strong>: cada bloco (ou arquivo) é cifrado com uma chave de dados própria; essa chave é cifrada com uma chave mestra guardada num KMS (serviço de gerenciamento de chaves) e armazenada junto aos metadados. Trocar a chave mestra exige recifrar só as chaves de dados, não os petabytes de conteúdo. Repare no conflito com a deduplicação: se cada usuário cifra com chaves diferentes, blocos iguais viram bytes diferentes e não podem ser deduplicados entre contas. Os serviços comerciais cifram no servidor, com chaves que eles controlam, justamente para manter a dedup; serviços com criptografia ponta a ponta abrem mão dela.</p>
 
 <h2 id="economia">Economizando espaço</h2>
 <ul>
@@ -225,7 +349,7 @@ device(device_id, user_id, last_logged_in)</code></pre>
 <li class="read"><a href="https://dropbox.tech/infrastructure/streaming-file-synchronization" target="_blank" rel="noopener">Dropbox: Streaming File Synchronization</a></li>
 <li class="read"><a href="https://dropbox.tech/infrastructure/rewriting-the-heart-of-our-sync-engine" target="_blank" rel="noopener">Dropbox: Rewriting the heart of our sync engine</a></li>
 <li class="read"><a href="https://www.hellointerview.com/learn/system-design/problem-breakdowns/dropbox" target="_blank" rel="noopener">Hello Interview: Dropbox</a></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=design+google+drive+dropbox+system+design+interview" target="_blank" rel="noopener">Vídeos: Design Dropbox / Google Drive</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=_UZ1ngy-kOI" target="_blank" rel="noopener">Hello Interview: Design Dropbox / Google Drive</a></li>
 </ul>
 
 </article>

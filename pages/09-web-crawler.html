@@ -22,6 +22,21 @@
 <li>Lidar com robots.txt, armadilhas, falhas e escala distribuída.</li>
 </ul></div>
 
+<h2 id="conceitos">Conceitos deste capítulo</h2>
+<div class="table-wrap"><table>
+<tr><th>Conceito</th><th>Definição</th></tr>
+<tr><td>Web crawler (spider, robô)</td><td>Programa que baixa páginas, extrai os links delas e repete o processo com as páginas novas.</td></tr>
+<tr><td>Seed URLs</td><td>As URLs iniciais de onde o rastreamento parte.</td></tr>
+<tr><td>URL frontier</td><td>A estrutura que guarda as URLs ainda não baixadas e decide qual baixar a seguir.</td></tr>
+<tr><td>Politeness</td><td>Não sobrecarregar nenhum site: poucas conexões e intervalo entre requisições ao mesmo host.</td></tr>
+<tr><td>Prioridade</td><td>Ordem de importância das URLs (popularidade, frequência de atualização), para baixar primeiro o que vale mais.</td></tr>
+<tr><td>Freshness</td><td>Quão atualizada está a cópia de uma página; exige revisitar páginas que mudam.</td></tr>
+<tr><td>robots.txt</td><td>Arquivo na raiz do site que diz quais caminhos os robôs podem ou não visitar.</td></tr>
+<tr><td>Normalização de URL</td><td>Reescrever URLs equivalentes numa forma única, para detectar duplicatas.</td></tr>
+<tr><td>Spider trap</td><td>Estrutura de links que gera infinitas URLs (por exemplo, um calendário sem fim).</td></tr>
+<tr><td>Checksum / SimHash</td><td>Hash do conteúdo para detectar páginas idênticas / hash que fica parecido para páginas parecidas.</td></tr>
+</table></div>
+
 <h2 id="usos">Para que serve um crawler</h2>
 <ul>
 <li><strong>Indexação de buscadores</strong> (Googlebot).</li>
@@ -46,7 +61,12 @@
 <ul>
 <li>1 bilhão de páginas/mês ÷ (30 × 10<sup>5</sup> s) ≈ <strong>400 páginas/s</strong>; pico ~800/s.</li>
 <li>Página média de 500 KB, então 1 bi × 500 KB = <strong>500 TB/mês</strong>, e em 5 anos <strong>30 PB</strong>.</li>
+<li>Banda de download: 400 páginas/s × 500 KB = 200 MB/s ≈ <strong>1,6 Gbps</strong> em média, ~3 Gbps no pico.</li>
+<li>Conexões simultâneas (Lei de Little): se cada download leva ~1 s em média (servidores lentos, DNS, TLS), há ~400 downloads em andamento a qualquer momento; no pico, ~800.</li>
 </ul>
+<p><strong>O que isso implica:</strong> a vazão em si é modesta (algumas dezenas de máquinas). Os desafios reais são outros: armazenar 30 PB (compressão e object storage), não baixar a mesma coisa duas vezes (dedup em bilhões de URLs) e, principalmente, distribuir os downloads entre milhões de sites diferentes sem sobrecarregar nenhum.</p>
+<div class="box info"><strong class="t">Politeness também é uma conta</strong>
+Se a regra é no máximo 1 requisição por segundo para cada host e queremos 400 páginas/s, precisamos estar baixando de <em>pelo menos 400 hosts diferentes ao mesmo tempo</em>. Na prática, muitos hosts pedem intervalos maiores (<code>Crawl-delay</code>), então o frontier precisa manter dezenas de milhares de hosts "prontos" em paralelo. É por isso que a estrutura com uma fila por host é necessária, e não só uma otimização.</div>
 
 <h2 id="alto-nivel">Design de alto nível</h2>
 <figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
@@ -76,6 +96,39 @@
 <tr><td>"URL seen?" + URL storage</td><td>Evita reprocessar URLs (Bloom filter ou hash table)</td></tr>
 </table></div>
 
+<h3>A vida de uma URL</h3>
+<p>Seguir uma URL do começo ao fim ajuda a ver por que cada componente existe:</p>
+<ol>
+  <li>A URL <code>https://Exemplo.com/blog/../noticias?utm_source=x#topo</code> é extraída de uma página.</li>
+  <li><strong>Normalização:</strong> vira <code>https://exemplo.com/noticias</code> (host em minúsculas, <code>..</code> resolvido, parâmetros de rastreamento e fragmento removidos). Sem isso, a mesma página aparece com dezenas de URLs diferentes.</li>
+  <li><strong>Filtro:</strong> não é <code>.jpg</code>, <code>.zip</code> nem um domínio bloqueado.</li>
+  <li><strong>"URL já vista?"</strong>: o Bloom filter diz que não. A URL é gravada no URL storage e entra no frontier.</li>
+  <li><strong>Frontier:</strong> o prioritizer dá nota alta (o site é popular), a URL entra numa front queue de alta prioridade e depois na back queue do host <code>exemplo.com</code>.</li>
+  <li>Quando o host está liberado (passou o intervalo desde o último download), um worker pega a URL, consulta o <strong>robots.txt</strong> em cache (o caminho <code>/noticias</code> é permitido) e o <strong>DNS</strong> em cache.</li>
+  <li><strong>Download</strong> com timeout. A resposta é HTML de 400 KB.</li>
+  <li><strong>"Conteúdo já visto?"</strong>: o hash não bate com nenhum anterior. O HTML é comprimido e armazenado.</li>
+  <li>O <strong>parser</strong> extrai 120 links, e cada um recomeça no passo 1. O host <code>exemplo.com</code> ganha um novo horário livre em, digamos, 1 s.</li>
+</ol>
+
+<h3>O fluxo numerado</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">sequenceDiagram
+  participant F as URL frontier
+  participant D as Downloader
+  participant DNS as DNS resolver
+  participant P as Parser
+  participant CS as "Content seen?"
+  participant LE as Link extractor
+  participant US as "URL seen?"
+  Note over F: 1. seeds entram no frontier
+  F->>D: 2. próxima URL
+  D->>DNS: 3. IP do host
+  D->>P: 4. HTML baixado
+  P->>CS: 5. conteúdo validado
+  CS-->>CS: 6. já visto? descarta
+  CS->>LE: 7. novo: guarda e extrai links
+  LE->>US: 8. links filtrados
+  US-->>US: 9. URL já vista? descarta
+  US->>F: 10. URL nova entra no frontier</pre></figure>
 <h2 id="bfs">DFS × BFS</h2>
 <p>A web é um grafo direcionado. DFS mergulha fundo demais. <strong>BFS</strong> (fila FIFO) é o padrão, mas tem dois problemas: (1) a maioria dos links de uma página aponta para o <em>mesmo host</em>, então a BFS pura martela um servidor (impolido); (2) não há prioridade, e nem toda página tem a mesma importância. O URL frontier resolve os dois.</p>
 
@@ -92,6 +145,15 @@
   R --> B1[Back queue: a.com] & B2[Back queue: b.com] & B3[Back queue: c.com]
   B1 & B2 & B3 --> HS["Seletor: heap pelo próximo horário livre do host"]
   HS --> W1[Worker 1] & W2[Worker 2]</pre></figure>
+<h3>Como as duas camadas de filas trabalham juntas</h3>
+<ul>
+  <li>As <strong>front queues</strong> respondem "o que é mais importante?". Há poucas (uma por nível de prioridade).</li>
+  <li>As <strong>back queues</strong> respondem "de quem posso baixar agora?". Cada uma contém URLs de um único host. Uma regra prática do design original (Mercator) é ter cerca de 3 back queues por thread de download, para sempre haver alguma liberada.</li>
+  <li>Um <strong>heap</strong> guarda, para cada back queue, o próximo instante em que o host pode ser acessado. O worker tira o topo do heap (o host liberado há mais tempo), baixa uma URL e devolve o host ao heap com horário = agora + intervalo.</li>
+  <li>Quando uma back queue esvazia, o seletor puxa URLs das front queues (com viés para as de alta prioridade) até encontrar uma de um host que ainda não tem fila, e cria a fila desse host.</li>
+</ul>
+<p>O intervalo por host pode ser fixo (1 s), vir do <code>Crawl-delay</code> do robots.txt, ou ser adaptativo: um múltiplo do tempo que o último download levou (se o servidor demorou 2 s para responder, espere 10× isso). Servidores lentos recebem menos carga automaticamente.</p>
+
 <h3>Freshness e armazenamento</h3>
 <ul>
 <li>Recrawl com base no histórico de mudanças da página; páginas importantes com mais frequência.</li>
@@ -202,6 +264,10 @@ func (h *hostHeap) Pop() any {
 	return x
 }</code></pre>
 
+<h3>Recrawl: quando visitar de novo</h3>
+<p>Uma página de notícias muda a cada minuto; uma página "sobre nós" muda uma vez por ano. Revisitar tudo na mesma frequência desperdiça banda com as estáticas e deixa as dinâmicas desatualizadas. A abordagem comum é <strong>adaptativa</strong>: a cada visita, compare com a versão anterior; se mudou, encurte o intervalo (por exemplo, pela metade); se não mudou, aumente-o (por exemplo, 1,5×), dentro de limites mínimo e máximo. Páginas importantes recebem um teto menor.</p>
+<p>Para economizar banda, use <strong>GET condicional</strong>: envie <code>If-Modified-Since</code> ou <code>If-None-Match</code> (com o <code>ETag</code> da última versão). Se a página não mudou, o servidor responde <code>304 Not Modified</code> sem corpo.</p>
+
 <h2 id="downloader">Deep dive: o downloader</h2>
 <ul>
 <li><strong>robots.txt</strong> (Robots Exclusion Protocol): baixe-o por domínio, <em>cacheie</em> e respeite <code>Disallow</code> e <code>Crawl-delay</code>.</li>
@@ -210,7 +276,44 @@ func (h *hostHeap) Pop() any {
 <li><strong>Localidade:</strong> crawlers perto dos sites (por região).</li>
 <li><strong>Timeouts curtos:</strong> servidores lentos não podem prender workers.</li>
 </ul>
+<h3>Um robots.txt real</h3>
+<pre><code class="language-text">User-agent: *
+Disallow: /admin/
+Disallow: /busca
+Crawl-delay: 5
 
+User-agent: MeuCrawler
+Disallow: /
+
+Sitemap: https://exemplo.com/sitemap.xml</code></pre>
+<p>Para o crawler genérico (<code>*</code>): não visitar <code>/admin/</code> nem <code>/busca</code> e esperar 5 s entre requisições. O crawler chamado <code>MeuCrawler</code> está proibido em todo o site. O <code>Sitemap</code> é um presente: lista as URLs que o dono quer indexadas, muitas vezes com data da última modificação, o que ajuda no recrawl. Cacheie o robots.txt por host (por exemplo, por 24 h) e, se ele der erro 5xx, seja conservador e não rastreie o host por um tempo.</p>
+<h3>Downloads assíncronos</h3>
+<p>Com centenas de downloads simultâneos que passam a maior parte do tempo esperando a rede, uma thread por download desperdiça memória. Crawlers modernos usam I/O assíncrono (event loop ou goroutines, que são baratas) e cada máquina mantém milhares de conexões abertas.</p>
+
+<h3>Por que a BFS pura é impolida</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  P["exemplo.com/index"] --> A["exemplo.com/a"]
+  P --> B["exemplo.com/b"]
+  P --> C["exemplo.com/c"]
+  P --> D["exemplo.com/d"]
+  P --> E["outro.com/x"]</pre>
+<figcaption>Quase todos os links de uma página levam ao mesmo site; numa fila FIFO única, eles saem em sequência e vários workers batem no mesmo servidor ao mesmo tempo.</figcaption></figure>
+<h3>Crawl distribuído</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  F[URL frontier] -->|"hash(host) → servidor"| D1[Downloader 1: hosts a–f]
+  F --> D2[Downloader 2: hosts g–p]
+  F --> D3[Downloader 3: hosts q–z]
+  D1 & D2 & D3 --> P[Parsers]
+  P --> F</pre>
+<figcaption>Cada downloader cuida de um subconjunto dos hosts e usa várias threads; a politeness de cada host fica num único lugar.</figcaption></figure>
+<h3>Extensibilidade</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  D[HTML downloader] --> P[Content parser]
+  P --> LE[Link extractor]
+  P --> PNG["Módulo novo: downloader de PNG"]
+  P --> WM["Módulo novo: monitor de direitos autorais"]
+  LE --> F[URL frontier]</pre>
+<figcaption>Novos tipos de conteúdo entram como módulos plugados no pipeline, sem reescrever o resto.</figcaption></figure>
 <h2 id="robustez">Robustez</h2>
 <ul>
 <li><strong>Consistent hashing</strong> para distribuir carga entre downloaders e permitir adicionar ou remover servidores.</li>
@@ -233,6 +336,21 @@ func New(n int, p float64) *Filter {
 	return &amp;Filter{bits: make([]uint64, (m+63)/64), m: m, k: max(k, 1)}
 }</code></pre>
 <p><strong>Conteúdo duplicado:</strong> comparar páginas caractere a caractere é lento. Compare <strong>hashes</strong> (checksum do conteúdo). Para quase duplicatas (mesma página com data diferente), use <strong>SimHash/MinHash</strong>.</p>
+<h3>Como o SimHash encontra quase duplicatas</h3>
+<p>Um hash comum (SHA-256) muda completamente se um único caractere mudar, então não serve para "quase igual". O SimHash faz o contrário: textos parecidos geram hashes parecidos.</p>
+<ol>
+  <li>Divida o texto em pedaços (palavras ou grupos de 3 palavras) e calcule o hash de 64 bits de cada pedaço.</li>
+  <li>Mantenha 64 contadores. Para cada pedaço, em cada posição de bit: se o bit for 1, some 1 ao contador; se for 0, subtraia 1.</li>
+  <li>O SimHash final tem bit 1 onde o contador ficou positivo e 0 onde ficou negativo.</li>
+</ol>
+<p>Se duas páginas compartilham 95% das palavras, quase todos os contadores apontam para o mesmo lado, e os SimHashes diferem em poucos bits. A regra usada pelo Google na indexação web foi considerar quase duplicatas páginas cujos SimHashes de 64 bits diferem em até 3 bits. Para não comparar cada página com bilhões de outras, os hashes são indexados em tabelas por blocos de bits (se diferem em até 3 de 64 bits, pelo menos um bloco de 16 bits é idêntico).</p>
+
+<h3>Armazenando 30 PB</h3>
+<ul>
+  <li><strong>Compressão:</strong> HTML comprime muito bem (texto repetitivo, ~5–10×), o que reduz 30 PB para alguns PB.</li>
+  <li><strong>Não um objeto por página:</strong> bilhões de objetos pequenos são caros em object storage (custo por requisição, metadados). O padrão é juntar milhares de páginas em arquivos grandes (como o formato WARC do Internet Archive) e manter um índice <code>URL → (arquivo, offset, tamanho)</code>.</li>
+  <li><strong>Camadas:</strong> a versão mais recente de cada página em armazenamento "quente"; versões antigas numa classe fria e barata.</li>
+</ul>
 
 <h2 id="armadilhas">Conteúdo problemático</h2>
 <ul>
@@ -267,7 +385,7 @@ func New(n int, p float64) *Filter {
 <li class="read"><a href="https://www.cs.cornell.edu/courses/cs685/2002fa/mercator.pdf" target="_blank" rel="noopener">Mercator: A Scalable, Extensible Web Crawler</a><small>Origem do design de front/back queues.</small></li>
 <li class="read"><a href="https://nlp.stanford.edu/IR-book/html/htmledition/web-crawling-and-indexes-1.html" target="_blank" rel="noopener">Introduction to Information Retrieval: Web crawling</a></li>
 <li class="read"><a href="https://www.hellointerview.com/learn/system-design/problem-breakdowns/web-crawler" target="_blank" rel="noopener">Hello Interview: Web crawler</a></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=design+web+crawler+system+design+interview" target="_blank" rel="noopener">Vídeos: Design a web crawler</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=krsuaUp__pM" target="_blank" rel="noopener">Hello Interview: Design a web crawler</a></li>
 </ul>
 
 </article>

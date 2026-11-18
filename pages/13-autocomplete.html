@@ -22,6 +22,18 @@
 <li>Escalar a trie (sharding por prefixo) e otimizar com cache no navegador.</li>
 </ul></div>
 
+<h2 id="conceitos">Conceitos deste capítulo</h2>
+<div class="table-wrap"><table>
+<tr><th>Conceito</th><th>Definição</th></tr>
+<tr><td>Autocomplete (typeahead)</td><td>Sugestões de busca que aparecem enquanto o usuário digita.</td></tr>
+<tr><td>Prefixo</td><td>O início de uma palavra ou frase ("be" é prefixo de "best").</td></tr>
+<tr><td>Trie (árvore de prefixos)</td><td>Árvore em que cada nó representa um prefixo e cada filho acrescenta um caractere.</td></tr>
+<tr><td>Top-k</td><td>Os k itens com maior pontuação (aqui, as 5 buscas mais frequentes de um prefixo).</td></tr>
+<tr><td>Agregação</td><td>Transformar milhões de eventos crus ("alguém buscou X às 10:01") em totais ("X: 12 mil buscas na semana").</td></tr>
+<tr><td>Snapshot</td><td>Cópia completa e imutável da trie num instante, usada para servir e para restaurar.</td></tr>
+<tr><td>Shard map manager</td><td>Componente que guarda quais faixas de prefixos ficam em cada servidor, ajustado pela distribuição real dos dados.</td></tr>
+</table></div>
+
 <h2 id="requisitos">Requisitos</h2>
 <div class="dialog">
 <p class="c">O casamento é só no início (prefixo) ou também no meio?</p><p class="i">Só no início.</p>
@@ -145,6 +157,21 @@ func (t *Trie) Suggest(prefix string) []Suggestion {
 	return n.top
 }</code></pre>
 
+<h3>Construindo os top-k de baixo para cima</h3>
+<p>Inserir cada consulta e atualizar o top-k de todos os seus ancestrais funciona, mas há uma forma mais eficiente na reconstrução em lote: uma travessia em pós-ordem. O top-k de um nó é o top-k da união de (a consulta que termina nele, se houver) com o top-k de cada filho. Como cada filho já tem seu top-k pronto, cada nó só mescla algumas listas de tamanho k. A trie inteira é processada uma única vez.</p>
+
+<h3>Quanta memória?</h3>
+<p>Suponha 1 bilhão de consultas distintas no histórico. A maioria é cauda longa: buscas feitas uma ou duas vezes, que nunca apareceriam num top 5. O primeiro passo é <strong>cortar a cauda</strong>: manter só consultas com frequência acima de um limiar, digamos as 50 milhões mais buscadas.</p>
+<ul>
+  <li>50 M consultas × ~20 caracteres compartilham muitos prefixos. Uma estimativa grosseira é algumas centenas de milhões de nós.</li>
+  <li>Cada nó com top-5 guarda 5 referências (ou ids de consulta, 4–8 bytes cada) mais os filhos: ~50–100 bytes.</li>
+  <li>Total: <strong>dezenas de GB</strong>. Cabe em memória num punhado de servidores, ou inteiro em cada servidor de uma frota replicada (servidores com 64–128 GB de RAM), o que elimina o sharding e simplifica muito.</li>
+</ul>
+<p>Uma alternativa à trie em memória é uma tabela <strong>prefixo → top-5</strong> num KV store (Redis, DynamoDB). Ela gasta mais espaço (cada prefixo é uma linha), mas é trivial de particionar e de servir, e a consulta continua sendo uma única leitura por chave.</p>
+
+<h3>Popularidade com decaimento</h3>
+<p>Contar a frequência de todos os tempos faz uma busca popular em 2019 ficar no topo para sempre. O comum é ponderar pelo tempo: <code>score = Σ buscas_da_semana_i × 0,5^(i / meia_vida)</code>, de modo que buscas recentes valham mais. Com meia-vida de 2 semanas, uma busca de 1 mês atrás vale um quarto de uma busca de hoje.</p>
+
 <h2 id="pipeline">Deep dive: pipeline de coleta</h2>
 <p>Atualizar a trie a cada busca (bilhões por dia) seria lento e desnecessário: o top 5 muda pouco. Em vez disso:</p>
 <figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
@@ -159,7 +186,14 @@ func (t *Trie) Suggest(prefix string) []Suggestion {
 <li><strong>Trie cache:</strong> a trie em memória distribuída, recarregada a cada snapshot semanal.</li>
 </ul>
 
-<h2 id="consulta">Serviço de consulta</h2>
+<h2 id="consulta">Serviço de consulta</h2><figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  U[Usuário digita] --> LB[Load balancer] --> API[API servers]
+  API -->|"1. top-5 de 'be'"| TC[(Trie cache: memória)]
+  TC -. "2. miss" .-> TDB[(Trie DB)]
+  TDB -.-> TC
+  API --> F[Filtro: remove sugestões bloqueadas]
+  F --> U</pre></figure>
+
 <ol>
 <li>Requisição chega ao LB e vai aos servidores de API.</li>
 <li>Busca no trie cache; num miss, busca no trie DB e repopula o cache.</li>
@@ -172,6 +206,10 @@ func (t *Trie) Suggest(prefix string) []Suggestion {
 <li><strong>Amostragem de logs:</strong> registrar 1 de cada N buscas, porque a popularidade sobrevive à amostragem.</li>
 </ul>
 
+<h3>Do teclado à sugestão: o tempo disponível</h3>
+<p>Uma pessoa digita uma tecla a cada ~150–300 ms. Para a sugestão parecer instantânea, ela precisa aparecer antes da próxima tecla. Descontando a rede (dezenas de ms em celular), sobram poucos milissegundos para o servidor. Por isso tudo no caminho de leitura é pré-computado: nenhum cálculo de ranking acontece na consulta, só uma busca em memória.</p>
+<p>No cliente, além de debounce e cache, há um truque comum: <strong>cancelar requisições obsoletas</strong>. Se o usuário digitou "ba" e depois "bat", a resposta de "ba" pode chegar <em>depois</em> da de "bat" e sobrescrever a lista certa com a errada. O cliente descarta respostas que não correspondem ao texto atual.</p>
+
 <h2 id="manutencao">Manutenção da trie</h2>
 <ul>
 <li><strong>Criar:</strong> pelos workers, a partir dos dados agregados.</li>
@@ -179,7 +217,19 @@ func (t *Trie) Suggest(prefix string) []Suggestion {
 <li><strong>Remover sugestões:</strong> conteúdo ofensivo, violento ou perigoso. Uma <strong>camada de filtro</strong> na frente do cache remove na hora; a remoção física acontece no próximo rebuild.</li>
 </ul>
 
-<h2 id="escala">Escalando o armazenamento</h2>
+<h3>Trocando a trie sem parar o serviço</h3>
+<p>Reconstruir a trie leva horas; servir não pode parar. O padrão é versionar: o job gera a trie da semana como um snapshot imutável (<code>trie-v2026-47</code>) no armazenamento; cada servidor carrega a nova versão em memória <em>ao lado</em> da antiga e, quando terminar, troca um ponteiro atomicamente e libera a antiga. Se a nova versão tiver um problema (sugestões estranhas), voltar é só trocar o ponteiro de novo. Isso exige memória para duas versões durante a troca.</p>
+
+<h2 id="escala">Escalando o armazenamento</h2><figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  API[API servers] -->|"qual shard tem 'be'?"| SM[Shard map manager]
+  SM -->|"shard 2"| API
+  API --> S1[("Shard 1: a")]
+  API --> S2[("Shard 2: b–c")]
+  API --> S3[("Shard 3: d–r")]
+  API --> S4[("Shard 4: s")]
+  API --> S5[("Shard 5: t–z")]</pre>
+<figcaption>Shards de tamanhos diferentes no alfabeto, mas parecidos em volume: "s" sozinho pode precisar de um shard inteiro.</figcaption></figure>
+
 <p>Sharding pela primeira letra (26 shards), depois pela segunda (aa–ag, ah–an…). Problema: a distribuição é desigual, porque há muito mais palavras com "s" do que com "x". Solução: um <strong>shard map manager</strong> que usa os dados históricos para combinar prefixos em shards de tamanho parecido (por exemplo, "s" sozinho num shard e "u–z" juntos em outro).</p>
 
 <h2 id="extras">Fechamento e follow-ups</h2>
@@ -189,6 +239,14 @@ func (t *Trie) Suggest(prefix string) []Suggestion {
 <li><strong>Tendências em tempo real</strong> (um evento quebra a internet): a reconstrução semanal não serve. Use streaming (Kafka + Flink) com janelas e pesos maiores para buscas recentes, mantendo uma trie "quente" pequena mesclada com a principal.</li>
 <li><strong>Personalização:</strong> mesclar o top global com o histórico do próprio usuário (no cliente ou num serviço separado).</li>
 </ul>
+
+<h3>Count-Min Sketch: contar sem guardar tudo</h3>
+<p>Para tendências em tempo real, contar exatamente cada consulta distinta exigiria um mapa com milhões de chaves por janela. O Count-Min Sketch é uma tabela de <em>d</em> linhas × <em>w</em> colunas de contadores, com uma função de hash por linha:</p>
+<ul>
+  <li><strong>Incrementar</strong> uma consulta: em cada linha, some 1 na coluna dada pelo hash daquela linha.</li>
+  <li><strong>Estimar</strong> a contagem: pegue o <em>mínimo</em> entre os d contadores da consulta.</li>
+</ul>
+<p>Colisões só podem <em>aumentar</em> um contador, nunca diminuir, então a estimativa nunca fica abaixo do valor real; usar o mínimo entre várias linhas escolhe o contador menos contaminado por colisões. Com alguns MB de memória fixa, o erro fica pequeno para as consultas frequentes, que são justamente as que interessam. Junto com um heap das k maiores estimativas, dá o top-k da janela.</p>
 
 <h2 id="simulacao">Simulação de entrevista</h2>
 <div class="dialog">
@@ -215,7 +273,7 @@ func (t *Trie) Suggest(prefix string) []Suggestion {
 <ul class="links">
 <li class="read"><a href="https://medium.com/@prefixyteam/how-we-built-prefixy-a-scalable-prefix-search-service-for-powering-autocomplete-c20f98e2eff1" target="_blank" rel="noopener">Prefixy: a scalable prefix search service</a></li>
 <li class="read"><a href="https://www.linkedin.com/blog/engineering/open-source/open-sourcing-typeaheadjs-the-library-that-powers-twitters-typeahead" target="_blank" rel="noopener">Typeahead em produção (LinkedIn/Twitter)</a></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=design+search+autocomplete+typeahead+system+design" target="_blank" rel="noopener">Vídeos: Design typeahead / autocomplete</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=us0qySiUsGU" target="_blank" rel="noopener">Tushar Roy: Design autocomplete / typeahead</a></li>
 <li class="read"><a href="https://en.wikipedia.org/wiki/Count%E2%80%93min_sketch" target="_blank" rel="noopener">Count-Min Sketch</a></li>
 </ul>
 

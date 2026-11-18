@@ -25,6 +25,25 @@
   </ul>
 </div>
 
+<h2 id="conceitos">Conceitos deste capítulo</h2>
+<div class="table-wrap"><table>
+<tr><th>Conceito</th><th>Definição</th></tr>
+<tr><td>DNS</td><td>Serviço que traduz um nome (<code>api.site.com</code>) para o endereço IP do servidor. Normalmente terceirizado e pago por consulta.</td></tr>
+<tr><td>Escala vertical</td><td>Aumentar a capacidade colocando mais CPU, RAM ou disco na mesma máquina.</td></tr>
+<tr><td>Escala horizontal</td><td>Aumentar a capacidade adicionando mais máquinas que dividem o trabalho.</td></tr>
+<tr><td>Load balancer</td><td>Componente que recebe o tráfego num endereço único e o distribui entre vários servidores, tirando do pool os que estão doentes.</td></tr>
+<tr><td>Replicação</td><td>Manter cópias dos mesmos dados em várias máquinas. No modelo primário–réplicas, só o primário aceita escritas e as réplicas servem leituras.</td></tr>
+<tr><td>Failover</td><td>Troca automática de um componente que falhou por um substituto (por exemplo, promover uma réplica a primário).</td></tr>
+<tr><td>Cache</td><td>Armazenamento temporário e rápido (em memória) do resultado de leituras frequentes ou caras, para não repeti-las.</td></tr>
+<tr><td>Política de expiração / evicção</td><td>Expiração: quanto tempo um item vive no cache (TTL). Evicção: qual item sai quando o cache enche (LRU, LFU, FIFO).</td></tr>
+<tr><td>CDN</td><td>Rede de servidores espalhados pelo mundo que guardam cópias de conteúdo estático perto dos usuários.</td></tr>
+<tr><td>Stateless × stateful</td><td>Um servidor stateless não guarda nada do usuário entre requisições; qualquer instância pode atender qualquer requisição. Um stateful guarda (por exemplo, a sessão), e o usuário precisa voltar ao mesmo servidor.</td></tr>
+<tr><td>GeoDNS</td><td>DNS que responde com IPs diferentes conforme a localização de quem pergunta, para levar cada usuário ao data center mais próximo.</td></tr>
+<tr><td>Fila de mensagens</td><td>Componente durável que guarda mensagens entre quem produz e quem consome, permitindo que os dois lados trabalhem em ritmos e momentos diferentes.</td></tr>
+<tr><td>Sharding</td><td>Dividir um banco grande em partes menores (shards) com o mesmo esquema, cada uma com um subconjunto dos dados, decidido por uma sharding key.</td></tr>
+<tr><td>SPOF</td><td><em>Single point of failure</em>: um componente cuja falha derruba o sistema inteiro.</td></tr>
+</table></div>
+
 <h2 id="servidor-unico">Passo 0: um único servidor</h2>
 <p>Tudo começa numa máquina: app web, banco de dados e cache juntos. O fluxo de uma requisição:</p>
 <ol>
@@ -38,8 +57,26 @@
   U -->|3. HTTP| S["Servidor único: app + banco"]</pre>
 <figcaption>Bom para um MVP. Um ponto único de falha (SPOF) e um limite físico de CPU/RAM.</figcaption></figure>
 
+<h3>O que acontece numa requisição, por dentro</h3>
+<p>Vale saber o caminho completo, porque cada etapa é um lugar onde dá para ganhar ou perder latência:</p>
+<ol>
+  <li><strong>Resolução DNS.</strong> O sistema operacional pergunta a um <em>resolver recursivo</em> (do provedor, ou 8.8.8.8). Se ele não tem a resposta em cache, consulta em cadeia: servidores raiz → servidor do TLD (<code>.com</code>) → servidor <em>autoritativo</em> do domínio, que devolve o registro <code>A</code> (IPv4) ou <code>AAAA</code> (IPv6). A resposta vem com um <strong>TTL</strong>: por quanto tempo resolvers e navegadores podem guardá-la em cache.</li>
+  <li><strong>Conexão TCP.</strong> Handshake de 3 vias (SYN, SYN-ACK, ACK): custa 1 ida e volta (RTT) antes de enviar qualquer byte.</li>
+  <li><strong>TLS.</strong> Negociação de chaves para HTTPS: mais 1 RTT no TLS 1.3 (2 no 1.2).</li>
+  <li><strong>HTTP.</strong> A requisição em si, mais 1 RTT, somado ao tempo de processamento no servidor.</li>
+</ol>
+<p>Com um RTT de 100 ms (usuário no Brasil, servidor nos EUA), uma primeira requisição custa ~300 ms <em>só de rede</em>, antes de o servidor fazer qualquer coisa. É por isso que CDN, edge e reaproveitamento de conexões (keep-alive, HTTP/2) importam tanto: eles atacam os RTTs, não o código.</p>
+<div class="box info"><strong class="t">Por que o TTL do DNS importa para system design</strong>
+O TTL decide a velocidade de um failover via DNS. Se o registro tem TTL de 1 hora e o servidor morre, parte dos clientes vai continuar tentando o IP antigo por até 1 hora. Serviços que dependem de failover por DNS usam TTL curto (30–60 s), ao custo de mais consultas. Outro ponto: muitos clientes ignoram o TTL e guardam o IP por mais tempo, então DNS sozinho nunca é um mecanismo de failover instantâneo.</div>
+
 <h2 id="banco-separado">Passo 1: separar o banco de dados</h2>
 <p>Com mais usuários, separamos a camada web (tráfego) da camada de dados. Agora cada uma pode escalar de forma independente.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  WEB[Navegador] -->|"HTTP: páginas HTML"| WS[Servidor web: app]
+  MOB[App mobile] -->|"HTTP: API JSON"| WS
+  WS -->|"leitura / escrita / atualização"| DB[(Servidor de banco)]
+  DB -->|"dados"| WS</pre>
+<figcaption>Duas camadas: o tráfego vem tanto do navegador (HTML) quanto de apps (JSON), e o banco fica numa máquina própria.</figcaption></figure>
 
 <h3>SQL (relacional) ou NoSQL?</h3>
 <div class="table-wrap"><table>
@@ -52,11 +89,27 @@
 <div class="box tip"><strong class="t">Regra prática para a entrevista</strong>
 Comece com <strong>relacional</strong>: é o padrão seguro e resolve 90% dos casos. Mude para NoSQL quando houver um motivo concreto: (1) latência muito baixa; (2) dados não estruturados ou sem relações; (3) só precisa serializar/deserializar (JSON, YAML); (4) volume massivo de escrita ou dados (TB/PB), por exemplo eventos, mensagens de chat ou métricas.</div>
 
+<h3>Os quatro tipos de NoSQL, e para que serve cada um</h3>
+<div class="table-wrap"><table>
+<tr><th>Tipo</th><th>Como guarda</th><th>Bom para</th><th>Exemplos</th></tr>
+<tr><td>Chave-valor</td><td>Um valor opaco por chave. Só sabe fazer <code>get</code>/<code>put</code>/<code>delete</code> por chave.</td><td>Sessões, cache, carrinho, feature flags, contadores</td><td>Redis, DynamoDB, Memcached</td></tr>
+<tr><td>Documento</td><td>JSON/BSON por chave, com campos aninhados e índices secundários.</td><td>Catálogo de produtos, perfis, conteúdo com esquema variável</td><td>MongoDB, Firestore, Couchbase</td></tr>
+<tr><td>Coluna larga</td><td>Linhas agrupadas por <em>partition key</em> e ordenadas por <em>clustering key</em> dentro da partição.</td><td>Séries temporais, mensagens de chat, feeds, eventos: muita escrita, leitura por intervalo</td><td>Cassandra, ScyllaDB, HBase, Bigtable</td></tr>
+<tr><td>Grafo</td><td>Nós e arestas como cidadãos de primeira classe.</td><td>Redes sociais (amigos de amigos), recomendação, detecção de fraude</td><td>Neo4j, Neptune</td></tr>
+</table></div>
+<p><strong>Como pensar:</strong> em SQL você modela os <em>dados</em> (normaliza) e depois escreve qualquer query. Em NoSQL você modela as <em>queries</em>: primeiro lista os padrões de acesso ("buscar as últimas 50 mensagens de uma conversa") e desenha a chave para que cada padrão vire uma leitura numa única partição. Se os padrões de acesso ainda não são conhecidos, isso é um forte argumento a favor de SQL.</p>
+<div class="box tip"><strong class="t">Exemplo: mensagens de chat</strong>
+Em Cassandra, uma tabela <code>messages</code> com partition key <code>conversation_id</code> e clustering key <code>message_id DESC</code> faz "últimas 50 mensagens da conversa X" ser uma leitura sequencial de uma única partição em um único nó. Em Postgres a mesma query funciona com um índice em <code>(conversation_id, message_id)</code>; o problema só aparece quando o volume de escrita passa do que um primário aguenta (dezenas de milhares de mensagens por segundo).</div>
+
 <h2 id="vertical-horizontal">Passo 2: escala vertical × horizontal</h2>
 <div class="procon">
   <div class="pro"><h5>Vertical (scale up): máquina maior</h5><ul><li>Simples: zero mudança no código.</li><li>Ótima com pouco tráfego.</li><li>Mas tem limite físico, custo exponencial e nenhum failover: se cair, cai tudo.</li></ul></div>
   <div class="con"><h5>Horizontal (scale out): mais máquinas</h5><ul><li>Escala quase ilimitada e redundância.</li><li>Exige load balancer, serviço stateless e dados particionados.</li><li>Mais complexidade operacional.</li></ul></div>
 </div>
+<p>Não subestime a escala vertical. Uma única máquina de nuvem grande hoje tem centenas de núcleos e terabytes de RAM, e um Postgres bem indexado nela aguenta dezenas de milhares de transações simples por segundo. Muitos produtos bem-sucedidos rodam por anos com um banco primário vertical e uma camada web horizontal.</p>
+<p>A regra que costuma valer na prática: <strong>a camada web escala horizontalmente desde cedo</strong> (é barato, porque ela é stateless), e <strong>a camada de dados escala verticalmente o máximo possível</strong> antes de partir para sharding (que é caro em complexidade). Na entrevista, diga isso explicitamente: mostra que você sabe onde está a dificuldade real.</p>
+<div class="box warn"><strong class="t">O custo escondido do horizontal</strong>
+Com 1 máquina, uma operação é local e atômica. Com N máquinas, você ganha problemas que não existiam: a rede falha e atrasa, os relógios divergem, uma máquina pode estar lenta em vez de morta, e você precisa decidir o que acontece quando metade do sistema não enxerga a outra metade. Os conceitos para lidar com isso estão em <a href="distribuidos.html">Sistemas distribuídos</a>.</div>
 
 <h2 id="load-balancer">Passo 3: load balancer</h2>
 <p>O LB recebe todo o tráfego num <strong>IP público</strong> e o distribui entre servidores web, que agora só têm IPs privados (mais seguro). Se o servidor 1 cai, o tráfego vai para o 2; se o tráfego cresce, adicionamos o servidor 3.</p>
@@ -72,6 +125,25 @@ Comece com <strong>relacional</strong>: é o padrão seguro e resolve 90% dos ca
   <li><strong>Health checks</strong> tiram do pool os servidores doentes.</li>
   <li>O próprio LB é redundante (par ativo-passivo ou serviço gerenciado como ALB/NLB).</li>
 </ul>
+
+<h3>Os algoritmos de balanceamento, explicados</h3>
+<div class="table-wrap"><table>
+<tr><th>Algoritmo</th><th>Como funciona</th><th>Quando usar</th><th>Armadilha</th></tr>
+<tr><td>Round robin</td><td>Manda para o servidor 1, 2, 3, 1, 2, 3…</td><td>Servidores iguais, requisições de custo parecido</td><td>Se uma requisição demora 10 s e outra 10 ms, a carga real fica desigual</td></tr>
+<tr><td>Weighted round robin</td><td>Servidor com peso 2 recebe o dobro</td><td>Máquinas de tamanhos diferentes; canary (1% do tráfego para a versão nova)</td><td>Pesos estáticos não reagem à carga real</td></tr>
+<tr><td>Least connections</td><td>Manda para quem tem menos conexões abertas</td><td>Requisições de duração variável, WebSockets, conexões longas</td><td>Um servidor recém-adicionado (com zero conexões) recebe uma avalanche</td></tr>
+<tr><td>Least response time / P2C</td><td>Sorteia 2 servidores e escolhe o menos carregado (<em>power of two choices</em>)</td><td>Padrão moderno em proxies como Envoy; quase tão bom quanto olhar todos, muito mais barato</td><td>Precisa de métricas de carga por servidor</td></tr>
+<tr><td>IP hash / consistent hash</td><td>Mesmo cliente (ou mesma chave) cai sempre no mesmo servidor</td><td>Afinidade: cache local por usuário, servidores com estado</td><td>Distribuição desigual se poucos clientes geram muito tráfego (um NAT corporativo)</td></tr>
+</table></div>
+
+<h3>Health checks e connection draining</h3>
+<ul>
+  <li><strong>Ativo:</strong> o LB chama <code>GET /health</code> a cada poucos segundos. Após N falhas seguidas, tira o servidor do pool; após M sucessos, devolve. O endpoint deve checar o que importa (o processo responde, consegue falar com o banco), mas sem derrubar o servidor se uma dependência <em>opcional</em> cair, ou um problema no banco tira todos os servidores do pool ao mesmo tempo.</li>
+  <li><strong>Passivo:</strong> o LB observa respostas reais (5xx, timeouts) e ejeta servidores ruins (<em>outlier detection</em>).</li>
+  <li><strong>Draining:</strong> num deploy ou scale-in, o servidor sai do pool para conexões novas, mas termina as que estão em andamento antes de desligar. Sem isso, cada deploy derruba requisições.</li>
+</ul>
+<div class="box info"><strong class="t">Como o próprio LB não vira ponto único de falha</strong>
+Três formas comuns: (1) <strong>par ativo-passivo com IP virtual</strong>: dois LBs, o passivo monitora o ativo e assume o IP se ele parar de responder (keepalived/VRRP); (2) <strong>vários LBs com DNS</strong>: o domínio resolve para vários IPs, cada um de um LB; (3) <strong>anycast</strong>: o mesmo IP é anunciado de vários lugares e a rede entrega ao mais próximo (é assim que Cloudflare e Google funcionam). Na nuvem, um ALB/NLB gerenciado já resolve isso por você.</div>
 
 <h2 id="replicacao">Passo 4: replicação do banco</h2>
 <p>O modelo mais comum é <strong>primário–réplicas</strong> (master–slave): só o primário aceita escritas, e as réplicas recebem cópias e atendem leituras. A maioria das aplicações tem muito mais leitura que escrita, então isso multiplica a capacidade.</p>
@@ -89,9 +161,41 @@ Comece com <strong>relacional</strong>: é o padrão seguro e resolve 90% dos ca
 <div class="box warn"><strong class="t">Cuidado com o atraso de replicação (replication lag)</strong>
 Replicação assíncrona significa que uma réplica pode estar alguns ms ou segundos atrasada. Exemplo clássico: o usuário edita o perfil, a página recarrega lendo de uma réplica e mostra o dado antigo. Soluções: <em>read-your-writes</em> (ler do primário por alguns segundos depois de uma escrita do próprio usuário), roteamento por sessão, ou replicação síncrona para dados críticos (mais lenta). No failover, a réplica promovida pode não ter as últimas escritas, e isso exige reconciliação.</div>
 
+<h3>Síncrona, assíncrona ou semi-síncrona</h3>
+<div class="table-wrap"><table>
+<tr><th>Modo</th><th>O primário confirma a escrita quando…</th><th>Prós</th><th>Contras</th></tr>
+<tr><td>Assíncrona</td><td>gravou localmente; réplicas recebem depois</td><td>Escrita rápida; réplica lenta não atrapalha</td><td>Se o primário morre, as escritas ainda não replicadas se perdem; réplicas ficam atrasadas</td></tr>
+<tr><td>Síncrona</td><td>todas as réplicas confirmaram</td><td>Nenhuma perda; réplicas sempre atualizadas</td><td>Latência da réplica mais lenta; se uma réplica cai, as escritas param</td></tr>
+<tr><td>Semi-síncrona</td><td>pelo menos 1 réplica confirmou</td><td>Garante que o dado existe em 2 máquinas sem depender de todas</td><td>Um pouco mais lenta que assíncrona</td></tr>
+</table></div>
+<p>A maioria dos bancos gerenciados usa assíncrona para réplicas de leitura e semi-síncrona ou síncrona para a réplica "de standby" que assume no failover (por exemplo, o Multi-AZ do RDS).</p>
+
+<h3>Como funciona um failover, passo a passo</h3>
+<ol>
+  <li><strong>Detecção:</strong> um monitor (ou as próprias réplicas) percebe que o primário não responde há X segundos. Escolher X é um trade-off: curto demais gera failovers falsos numa simples pausa de rede; longo demais deixa o sistema sem escrita por mais tempo.</li>
+  <li><strong>Eleição:</strong> escolhe-se a réplica mais atualizada (a que recebeu mais do log de replicação).</li>
+  <li><strong>Reconfiguração:</strong> as outras réplicas passam a seguir o novo primário, e as aplicações passam a escrever nele (via DNS, proxy ou endpoint do serviço gerenciado).</li>
+  <li><strong>Cerca (fencing):</strong> o primário antigo, se voltar, precisa ser impedido de aceitar escritas.</li>
+</ol>
+<div class="box warn"><strong class="t">Split brain</strong>
+Se o primário antigo só estava isolado da rede (não morto) e continua aceitando escritas enquanto um novo primário foi eleito, você tem dois primários divergindo: o <em>split brain</em>. Os dados escritos em cada lado entram em conflito. A defesa é exigir maioria (quórum) para eleger um líder e usar um <em>fencing token</em> (um número de época que aumenta a cada eleição; o armazenamento rejeita escritas com época antiga). Mais em <a href="distribuidos.html">Sistemas distribuídos</a>.</div>
+
+<h3>Além do primário–réplicas</h3>
+<ul>
+  <li><strong>Multi-líder:</strong> cada região tem um primário que aceita escritas e replica para os outros. Ótimo para multi-região, mas escritas concorrentes no mesmo dado geram conflitos que precisam de regra de resolução (last-write-wins, merge).</li>
+  <li><strong>Sem líder (leaderless):</strong> o cliente escreve em várias réplicas e lê de várias, com quórum (W + R &gt; N). É o modelo do Dynamo e do Cassandra, detalhado no <a href="06-key-value-store.html">capítulo 06</a>.</li>
+</ul>
+
 <h2 id="cache">Passo 5: cache</h2>
 <p>Cache é armazenamento temporário em memória para dados lidos com frequência ou caros de calcular. Ler da RAM leva ~100 ns; ler do banco pela rede, alguns ms.</p>
 <p>Padrão mais comum, <strong>cache-aside</strong> (read-through feito pela aplicação): procura no cache; num miss, lê do banco e grava no cache.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  WS[Servidor web] -->|"1. o dado está no cache?"| C[(Cache)]
+  C -->|"2a. sim: devolve"| WS
+  WS -->|"2b. não: lê do banco"| DB[(Banco)]
+  DB --> WS
+  WS -->|"3. grava no cache"| C</pre>
+<figcaption>A camada de cache fica entre os servidores e o banco e escala separadamente.</figcaption></figure>
 <div class="code-title">go/cache/lru.go (trecho): LRU com TTL e cache-aside</div>
 <pre><code class="language-go" data-src="go/cache/lru.go" data-lines="81-92">// GetOrLoad implementa cache-aside. `load` é a ida ao banco.
 func (c *LRU[V]) GetOrLoad(key string, load func(string) (V, error)) (V, error) {
@@ -115,7 +219,48 @@ func (c *LRU[V]) GetOrLoad(key string, load func(string) (V, error)) (V, error) 
 <tr><td>Evicção</td><td>LRU (mais comum), LFU, FIFO.</td></tr>
 <tr><td>Thundering herd</td><td>Chave popular expira e mil requisições vão ao banco juntas. Mitigue com lock/single-flight, TTL com jitter e refresh antecipado.</td></tr>
 </table></div>
-<p>Outras estratégias (write-through, write-back, read-through) estão em <a href="ferramentas.html#cache">Ferramentas → Cache</a>.</p>
+<h3>Por que o cache ajuda tanto: a conta</h3>
+<p>Suponha 10.000 leituras/s, banco com latência de 5 ms e cache com 0,5 ms.</p>
+<div class="table-wrap"><table>
+<tr><th>Hit rate</th><th>Leituras/s que chegam ao banco</th><th>Latência média</th></tr>
+<tr><td>0% (sem cache)</td><td>10.000</td><td>5 ms</td></tr>
+<tr><td>80%</td><td>2.000</td><td>0,8 × 0,5 + 0,2 × 5,5 = 1,5 ms</td></tr>
+<tr><td>95%</td><td>500</td><td>0,95 × 0,5 + 0,05 × 5,5 = 0,75 ms</td></tr>
+<tr><td>99%</td><td>100</td><td>0,55 ms</td></tr>
+</table></div>
+<p>Note duas coisas. Primeiro, ir de 95% para 99% de hit rate corta a carga no banco em <strong>5×</strong>: os últimos pontos percentuais valem muito. Segundo, a conta inversa também vale: se o cache cair, o banco recebe de repente 20× ou 100× mais carga do que está acostumado e provavelmente cai junto. Um cache que segura a maior parte do tráfego deixou de ser otimização e virou dependência crítica; trate-o com a mesma redundância do banco.</p>
+
+<h3>Onde dá para colocar cache</h3>
+<ol>
+  <li><strong>Cliente</strong> (navegador, app): headers <code>Cache-Control</code>, <code>ETag</code>. A requisição mais rápida é a que não acontece.</li>
+  <li><strong>CDN</strong>: estáticos e respostas públicas.</li>
+  <li><strong>Memória local do servidor</strong>: zero rede, mas cada servidor tem sua cópia (inconsistência entre servidores, memória duplicada). Bom para dados pequenos e quase imutáveis, como configurações.</li>
+  <li><strong>Cache distribuído</strong> (Redis/Memcached): compartilhado por todos os servidores. O padrão quando se fala em "cache" na entrevista.</li>
+  <li><strong>Banco</strong>: buffer pool, views materializadas.</li>
+</ol>
+
+<h3>Estratégias de escrita</h3>
+<div class="table-wrap"><table>
+<tr><th>Estratégia</th><th>Como funciona</th><th>Quando usar</th></tr>
+<tr><td>Cache-aside (lazy loading)</td><td>A aplicação lê do cache; num miss, lê do banco e popula. Na escrita, grava no banco e <em>apaga</em> a chave no cache.</td><td>Padrão geral. Só cacheia o que é lido de fato.</td></tr>
+<tr><td>Read-through</td><td>Igual ao cache-aside, mas é a biblioteca/camada de cache que vai ao banco, não a aplicação.</td><td>Quando você quer esconder o banco atrás do cache.</td></tr>
+<tr><td>Write-through</td><td>Toda escrita vai ao cache e ao banco, de forma síncrona.</td><td>Dados lidos logo após serem escritos. Escrita fica mais lenta e você cacheia coisas que talvez ninguém leia.</td></tr>
+<tr><td>Write-back (write-behind)</td><td>Escreve só no cache e confirma; o cache persiste no banco depois, em lote.</td><td>Escrita muito intensa e tolerância a perder dados (contadores de visualização). Se o cache morre antes de persistir, perde.</td></tr>
+</table></div>
+
+<h3>Por que apagar, e não atualizar, o cache na escrita</h3>
+<p>Imagine duas escritas concorrentes no mesmo usuário, A (nome = "Ana") e B (nome = "Bia"). Se cada uma faz "grava no banco, depois <em>atualiza</em> o cache", a ordem pode intercalar assim: A grava no banco, B grava no banco, B atualiza o cache, A atualiza o cache. Banco = "Bia", cache = "Ana", e fica errado até o TTL vencer. Se em vez de atualizar você <em>apaga</em>, a próxima leitura busca o valor correto no banco. Ainda existe uma janela rara de inconsistência (uma leitura lenta pode repopular com valor antigo), e é por isso que <strong>todo cache deve ter TTL</strong>, mesmo que longo: ele limita por quanto tempo um erro pode durar.</p>
+
+<h3>Políticas de evicção</h3>
+<ul>
+  <li><strong>LRU</strong> (least recently used): remove o que foi usado há mais tempo. Bom padrão: o que foi acessado recentemente tende a ser acessado de novo.</li>
+  <li><strong>LFU</strong> (least frequently used): remove o menos acessado no total. Melhor quando há itens "sempre populares", mas demora a esquecer algo que foi popular e deixou de ser.</li>
+  <li><strong>FIFO / aleatório</strong>: simples e baratos; o Redis usa LRU <em>aproximado</em> por amostragem justamente porque LRU exato custa memória.</li>
+</ul>
+
+<h3>Chaves quentes (hot keys)</h3>
+<p>Em um cache distribuído, cada chave mora em um nó. Se uma chave recebe 200 mil leituras/s (a página de um evento ao vivo), aquele nó satura enquanto os outros ficam ociosos. Soluções: cache local no servidor de aplicação por poucos segundos para as chaves mais quentes, ou replicar a chave com sufixos (<code>evento:42#1</code> … <code>evento:42#8</code>) e ler de um sufixo aleatório.</p>
+<p>Mais estratégias em <a href="ferramentas.html#cache">Ferramentas → Cache</a>.</p>
 
 <h2 id="cdn">Passo 6: CDN</h2>
 <p>Uma CDN é uma rede de servidores geograficamente distribuídos (edge/PoPs) que cacheia conteúdo estático (imagens, vídeos, CSS, JS) perto do usuário. Um usuário em Lisboa baixa a imagem de um PoP em Lisboa, não do servidor em São Paulo.</p>
@@ -124,9 +269,43 @@ func (c *LRU[V]) GetOrLoad(key string, load func(string) (V, error)) (V, error) 
   <li>Se o PoP não tem o arquivo, busca na <em>origem</em> (servidor ou S3) e cacheia conforme o header <code>Cache-Control</code>/TTL.</li>
   <li>Os próximos usuários da região recebem direto do PoP.</li>
 </ol>
+<figure class="mermaid-wrap"><pre class="mermaid">sequenceDiagram
+  participant A as Usuário A (Lisboa)
+  participant P as PoP da CDN (Lisboa)
+  participant O as Origem (S3 / servidor)
+  participant B as Usuário B (Lisboa)
+  A->>P: GET logo.png
+  P->>O: não tenho: busca na origem
+  O-->>P: logo.png + Cache-Control: max-age=86400
+  P-->>A: logo.png (miss: lento)
+  B->>P: GET logo.png
+  P-->>B: logo.png (hit: rápido, sem ir à origem)</pre>
+<figcaption>O primeiro acesso de cada região paga a ida à origem; os seguintes são servidos pelo PoP até o TTL vencer.</figcaption></figure>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  U[Usuários] -->|"HTML / API"| LB[Load balancer] --> W[Servidores web]
+  U -->|"imagens, JS, CSS, vídeo"| CDN[CDN]
+  CDN -->|"miss"| S[(Origem / object storage)]
+  W --> C[(Cache)]
+  W --> DB[(Banco: primário + réplicas)]</pre>
+<figcaption>Arquitetura depois de CDN e cache: os estáticos nem chegam aos servidores web.</figcaption></figure>
 <p><strong>Considerações:</strong> custo (você paga por transferência, então não cacheie o que é pouco acessado), TTL adequado, fallback para a origem se a CDN falhar, invalidação (API da CDN ou <em>versionamento de URL</em>: <code>app.v42.js</code>).</p>
+<h3>Pull × push</h3>
+<ul>
+  <li><strong>Pull CDN</strong> (o modelo acima): a CDN busca na origem no primeiro acesso. Zero trabalho para você; o primeiro usuário de cada região paga a latência do miss. É o padrão.</li>
+  <li><strong>Push CDN</strong>: você envia os arquivos para a CDN antes de alguém pedir. Faz sentido para arquivos grandes e previsíveis, como o lançamento de um episódio de série, em que você quer tudo nas bordas antes da estreia.</li>
+</ul>
+<h3>Versionamento de URL, em detalhe</h3>
+<p>Invalidar uma CDN é lento (pode levar minutos para chegar a todos os PoPs) e às vezes cobrado. O truque é nunca precisar invalidar: o nome do arquivo inclui um hash do conteúdo (<code>app.3f9a1c.js</code>), com TTL de 1 ano. Quando o arquivo muda, o hash muda, o HTML aponta para o novo nome, e o antigo simplesmente deixa de ser pedido. Só o HTML, que é pequeno, fica com TTL curto.</p>
+<h3>CDN para conteúdo dinâmico</h3>
+<p>Mesmo respostas que não podem ser cacheadas se beneficiam de passar pela CDN: o usuário termina TCP+TLS no PoP próximo (RTT curto), e o PoP fala com a origem por conexões já abertas e rotas otimizadas. Respostas públicas e iguais para todos (a home de um portal de notícias) podem ser cacheadas por poucos segundos, o que já corta a maior parte da carga num pico.</p>
 
 <h2 id="stateless">Passo 7: camada web stateless</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  A[Usuária A] --> S1["Servidor 1: sessão de A"]
+  B[Usuário B] --> S2["Servidor 2: sessão de B"]
+  C[Usuária C] --> S3["Servidor 3: sessão de C"]
+  A -. "se cair no servidor 2: não autenticada" .-> S2</pre>
+<figcaption>Arquitetura stateful: cada usuário fica preso ao servidor que guarda sua sessão.</figcaption></figure>
 <p>Se a sessão do usuário fica na memória do servidor A, toda requisição dele precisa ir ao A (<em>sticky sessions</em>), o que atrapalha o balanceamento e impede derrubar servidores. A solução é tirar o estado da camada web e colocá-lo num store compartilhado (Redis, DynamoDB, banco) ou num token assinado (JWT).</p>
 <figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
   U[Usuários] --> LB[Load balancer]
@@ -135,15 +314,53 @@ func (c *LRU[V]) GetOrLoad(key string, load func(string) (V, error)) (V, error) 
   LB --> W3[Web N: autoscaling]
   W1 & W2 & W3 --> S[(Store de sessão: Redis/NoSQL)]</pre></figure>
 <p>Com servidores stateless, o <strong>autoscaling</strong> fica trivial: adicione ou remova servidores conforme CPU ou fila de requisições, sem perder sessões.</p>
+<h3>Store de sessão × token assinado (JWT)</h3>
+<div class="procon">
+  <div class="pro"><h5>Sessão no Redis</h5><ul><li>O cliente guarda só um ID aleatório.</li><li>Logout e revogação são imediatos: apague a chave.</li><li>Custa uma ida ao Redis por requisição, e o Redis precisa ser altamente disponível.</li></ul></div>
+  <div class="con"><h5>JWT</h5><ul><li>O token carrega os dados (user_id, papéis, expiração) assinados pelo servidor; qualquer servidor valida sem consultar nada.</li><li>Revogar é difícil: o token vale até expirar. Por isso se usa token de acesso curto (5–15 min) + refresh token guardado no servidor.</li><li>Tokens grandes vão em toda requisição.</li></ul></div>
+</div>
+<h3>Autoscaling na prática</h3>
+<ul>
+  <li><strong>Métrica:</strong> CPU média é a mais comum; para serviços limitados por I/O, use requisições em andamento ou latência. Para workers, use o tamanho da fila.</li>
+  <li><strong>Tempo de reação:</strong> uma máquina nova leva de 30 s (container) a alguns minutos (VM) para ficar pronta. O autoscaling não salva você de um pico que chega em segundos; para isso, mantenha folga (por exemplo, escalar quando a CPU passar de 50–60%, não de 90%) ou pré-escale antes de eventos conhecidos.</li>
+  <li><strong>Escalar para baixo devagar:</strong> reduza capacidade com calma para não oscilar (sobe, desce, sobe).</li>
+</ul>
 
 <h2 id="multi-dc">Passo 8: múltiplos data centers</h2>
 <p>Para disponibilidade e latência global, os usuários são roteados por <strong>GeoDNS</strong> para o data center mais próximo (por exemplo, 70% US-East, 30% EU-West). Se um DC cai, todo o tráfego vai para o outro.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart TB
+  U[Usuários] --> G[GeoDNS]
+  G -->|"usuários das Américas"| LB1[LB: DC Américas]
+  G -->|"usuários da Europa"| LB2[LB: DC Europa]
+  subgraph DC1[Data center 1]
+    LB1 --> W1[Web] --> C1[(Cache)] & D1[(Banco)]
+  end
+  subgraph DC2[Data center 2]
+    LB2 --> W2[Web] --> C2[(Cache)] & D2[(Banco)]
+  end
+  D1 <-. "replicação entre regiões" .-> D2</pre>
+<figcaption>Operação normal: cada usuário vai ao DC mais próximo.</figcaption></figure>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart TB
+  U[Usuários] --> G[GeoDNS]
+  G -->|"100% do tráfego"| LB1[LB: DC Américas]
+  G -. "DC fora do ar: removido do DNS" .-> X[DC Europa ✕]
+  LB1 --> W1[Web] --> D1[(Banco: com os dados replicados da Europa)]</pre>
+<figcaption>Falha de um DC: o GeoDNS manda tudo para o DC saudável, que precisa ter capacidade e dados para isso.</figcaption></figure>
 <p><strong>Desafios técnicos:</strong></p>
 <ul>
   <li><strong>Redirecionamento de tráfego:</strong> GeoDNS ou anycast.</li>
   <li><strong>Sincronização de dados:</strong> cada região tem seu banco; num failover, o outro DC precisa ter os dados. Replicação assíncrona entre regiões (Netflix faz isso) traz consistência eventual e conflitos.</li>
   <li><strong>Teste e deploy:</strong> automação para manter os DCs idênticos e testar a aplicação em várias regiões.</li>
 </ul>
+<h3>Ativo-passivo × ativo-ativo</h3>
+<div class="table-wrap"><table>
+<tr><th></th><th>Ativo-passivo</th><th>Ativo-ativo</th></tr>
+<tr><td>Tráfego</td><td>Só uma região atende; a outra fica de reserva recebendo réplicas</td><td>Todas as regiões atendem usuários</td></tr>
+<tr><td>Escritas</td><td>Um único primário: sem conflitos</td><td>Cada região escreve: conflitos possíveis, ou cada usuário "pertence" a uma região (home region)</td></tr>
+<tr><td>Failover</td><td>Minutos (promover banco, virar DNS); você só descobre se o passivo funciona quando precisa dele</td><td>Rápido: a outra região já está quente</td></tr>
+<tr><td>Custo e complexidade</td><td>Menores</td><td>Maiores</td></tr>
+</table></div>
+<p>Dois números definem o quanto investir: <strong>RTO</strong> (Recovery Time Objective, quanto tempo fora do ar é aceitável) e <strong>RPO</strong> (Recovery Point Objective, quantos segundos de dados você aceita perder). Um RPO de zero exige replicação síncrona entre regiões, o que adiciona dezenas de milissegundos a cada escrita. Pergunte esses números ao entrevistador em vez de assumir "zero perda, zero indisponibilidade".</p>
 
 <h2 id="filas">Passo 9: fila de mensagens</h2>
 <p>Uma fila é um buffer durável que <strong>desacopla</strong> produtores e consumidores. O produtor publica e segue a vida; consumidores processam no seu ritmo. Exemplo: um upload de foto publica "processar foto" e workers aplicam filtros e geram miniaturas. Se a fila cresce, adicionamos workers; se esvazia, removemos.</p>
@@ -152,7 +369,27 @@ func (c *LRU[V]) GetOrLoad(key string, load func(string) (V, error)) (V, error) 
   P2[Web: produtor] -->|publica| Q
   Q -->|consome| C1[Worker]
   Q -->|consome| C2[Worker]</pre></figure>
+<h3>Exemplo: processamento de fotos</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  U[Usuário envia foto] --> W[Servidor web]
+  W -->|"1. grava original"| S[(Object storage)]
+  W -->|"2. publica: processar foto 123"| Q[[Fila]]
+  W -->|"3. responde já: recebida"| U
+  Q --> P1[Worker: miniaturas]
+  Q --> P2[Worker: filtros / compressão]
+  P1 & P2 --> S</pre>
+<figcaption>O usuário não espera o processamento; os workers escalam pelo tamanho da fila.</figcaption></figure>
 <p>Benefícios: tolerância a picos, isolamento de falhas (o consumidor caiu? as mensagens esperam), escala independente, retries. Kafka × RabbitMQ × SQS está em <a href="ferramentas.html#filas">Ferramentas</a>.</p>
+<h3>O que você precisa saber sobre filas</h3>
+<ul>
+  <li><strong>Garantia de entrega.</strong> Quase todas as filas oferecem <em>at-least-once</em>: se o worker processa a mensagem e morre antes de confirmar (ack), ela é entregue de novo. Logo, o processamento precisa ser <strong>idempotente</strong>: processar duas vezes tem o mesmo efeito que uma. A técnica comum é guardar o ID da mensagem já processada (ou usar uma chave única no banco) e ignorar repetições. <em>Exactly-once</em> de ponta a ponta praticamente não existe; o que existe é at-least-once + idempotência.</li>
+  <li><strong>Visibility timeout.</strong> No SQS, quando um worker pega uma mensagem, ela fica invisível por X segundos. Se não houver ack nesse tempo, ela volta para a fila. X precisa ser maior que o tempo de processamento, senão dois workers processam a mesma mensagem.</li>
+  <li><strong>Retries e DLQ.</strong> Mensagens que falham repetidamente (dado inválido, bug) não podem ficar voltando para sempre e bloqueando a fila. Depois de N tentativas, vão para uma <em>dead-letter queue</em>, onde alguém investiga.</li>
+  <li><strong>Ordem.</strong> Filas comuns não garantem ordem entre mensagens. Se a ordem importa (eventos da mesma conta), use partições por chave (Kafka) ou filas FIFO com group ID.</li>
+  <li><strong>Backpressure.</strong> A fila absorve picos, mas não cria capacidade. Se a taxa de chegada fica acima da taxa de processamento por muito tempo, a fila cresce sem parar. Monitore a <em>idade da mensagem mais antiga</em>, não só o tamanho da fila.</li>
+</ul>
+<div class="box tip"><strong class="t">Quando usar fila (e quando não)</strong>
+Use quando o usuário não precisa do resultado na hora: enviar e-mail, gerar miniaturas, processar pagamento já autorizado, atualizar índices de busca. Não use quando a resposta depende do resultado: validar senha no login não vai para uma fila. Uma pergunta útil: "se esse passo atrasar 30 segundos, alguém percebe?"</div>
 
 <h2 id="observabilidade">Passo 10: logs, métricas e automação</h2>
 <ul>
@@ -161,6 +398,15 @@ func (c *LRU[V]) GetOrLoad(key string, load func(string) (V, error)) (V, error) 
   <li><strong>Tracing distribuído</strong> (OpenTelemetry) para seguir uma requisição entre serviços.</li>
   <li><strong>CI/CD</strong> para builds, testes e deploys automatizados.</li>
 </ul>
+<h3>O que monitorar: os quatro sinais de ouro</h3>
+<p>Para cada serviço, quatro métricas respondem "está saudável?":</p>
+<ol>
+  <li><strong>Latência:</strong> use percentis (p50, p95, p99), não média. Uma média de 50 ms pode esconder 1% de requisições levando 3 s, e se uma página faz 100 chamadas, quase todo usuário encontra uma dessas.</li>
+  <li><strong>Tráfego:</strong> requisições por segundo.</li>
+  <li><strong>Erros:</strong> taxa de 5xx e de respostas erradas.</li>
+  <li><strong>Saturação:</strong> quão perto do limite (CPU, memória, conexões do banco, tamanho de fila).</li>
+</ol>
+<p>Sobre isso se definem <strong>SLIs</strong> (o que medir, por exemplo "% de requisições abaixo de 300 ms"), <strong>SLOs</strong> (a meta interna: 99,9% num mês) e <strong>SLAs</strong> (o contrato com o cliente, com multa). 99,9% de disponibilidade permite ~43 minutos fora do ar por mês; 99,99% permite ~4 minutos.</p>
 
 <h2 id="sharding">Passo 11: sharding do banco</h2>
 <p>Quando nem o maior servidor dá conta das escritas ou do volume de dados, dividimos o banco em <strong>shards</strong>: bancos com o mesmo esquema e dados diferentes. A <em>sharding key</em> decide onde cada linha mora, por exemplo <code>user_id % 4</code>.</p>
@@ -178,6 +424,28 @@ func (c *LRU[V]) GetOrLoad(key string, load func(string) (V, error)) (V, error) 
 <tr><td>Joins e desnormalização</td><td>Joins entre shards são caros ou inviáveis.</td><td>Desnormalizar para responder por um único shard.</td></tr>
 <tr><td>Transações entre shards</td><td>Exigem 2PC ou sagas.</td><td>Modelar para que as transações fiquem em um shard.</td></tr>
 </table></div>
+
+<h3>As estratégias de particionamento</h3>
+<div class="table-wrap"><table>
+<tr><th>Estratégia</th><th>Como decide o shard</th><th>Bom para</th><th>Problema</th></tr>
+<tr><td>Por intervalo (range)</td><td>Faixas da chave: A–F no shard 1, G–M no 2…; ou por data</td><td>Consultas por intervalo ("pedidos de março")</td><td>Hotspots: com chave por data, todas as escritas de hoje vão para o mesmo shard</td></tr>
+<tr><td>Por hash</td><td><code>hash(chave)</code> decide</td><td>Distribuição uniforme</td><td>Consultas por intervalo viram scatter-gather em todos os shards</td></tr>
+<tr><td>Por diretório (lookup)</td><td>Uma tabela diz em que shard cada chave (ou cliente) está</td><td>Flexibilidade total: mover um cliente grande para um shard só dele</td><td>A tabela de lookup vira dependência crítica e precisa de cache</td></tr>
+<tr><td>Geográfica</td><td>Pela região do usuário</td><td>Latência e leis de residência de dados (LGPD, GDPR)</td><td>Regiões de tamanhos muito diferentes</td></tr>
+</table></div>
+
+<h3>Exemplo: escolhendo a sharding key de um e-commerce</h3>
+<ul>
+  <li><strong><code>order_id</code></strong>: distribui bem, mas "listar os pedidos do usuário 42" precisa consultar todos os shards.</li>
+  <li><strong><code>user_id</code></strong>: todos os pedidos de um usuário ficam juntos, então a tela "meus pedidos" é uma consulta num shard só, e uma transação que mexe nos dados de um único usuário também. Distribui bem se nenhum usuário for gigante. Geralmente é a melhor escolha.</li>
+  <li><strong><code>created_at</code></strong>: péssima para escrita (todo pedido novo cai no mesmo shard).</li>
+  <li>E a visão do <em>vendedor</em> ("pedidos da minha loja")? Com shard por <code>user_id</code>, ela fica espalhada. A solução usual é um <strong>índice secundário global</strong>, uma segunda tabela particionada por <code>seller_id</code>, mantida de forma assíncrona (via eventos/CDC), aceitando um pequeno atraso.</li>
+</ul>
+
+<h3>Resharding sem dor: shards lógicos</h3>
+<p>Em vez de <code>hash % 4</code> com 4 servidores, crie de início <strong>muitos shards lógicos</strong> (por exemplo, 1.024) com <code>hash % 1024</code> e mapeie vários shards lógicos para cada servidor físico (256 por servidor). Para adicionar um servidor, você move alguns shards lógicos <em>inteiros</em> para ele; a função de hash nunca muda, só a tabela "shard lógico → servidor". É o que fazem Vitess, Citus e a maioria dos sistemas em produção. Consistent hashing (<a href="05-consistent-hashing.html">capítulo 05</a>) resolve o mesmo problema de outro jeito.</p>
+<div class="box interview"><strong class="t">Na entrevista</strong>
+Não proponha sharding cedo. Mostre com números que um único primário (com réplicas e cache) não aguenta, seja pelas escritas por segundo, seja pelo volume em TB, e só então escolha a chave justificando pelos padrões de acesso.</div>
 
 <h2 id="final">A arquitetura final</h2>
 <figure class="mermaid-wrap"><pre class="mermaid">flowchart TB
@@ -205,6 +473,16 @@ func (c *LRU[V]) GetOrLoad(key string, load func(string) (V, error)) (V, error) 
   <li>Camadas divididas em serviços independentes.</li>
   <li>Monitoramento e automação.</li>
 </ul></div>
+
+<h2 id="erros-comuns">Erros comuns</h2>
+<ul>
+  <li><strong>Começar pelo fim.</strong> Desenhar Kafka, sharding e microsserviços para um sistema de 10 mil usuários. Comece simples e evolua conforme os números.</li>
+  <li><strong>Esquecer redundância em uma camada.</strong> Três servidores web, mas um único Redis sem réplica: o sistema é tão disponível quanto a peça menos redundante.</li>
+  <li><strong>Cache sem TTL e sem plano para quando ele cai.</strong></li>
+  <li><strong>Ler de réplica logo depois de escrever</strong> sem pensar em atraso de replicação.</li>
+  <li><strong>Tratar a fila como mágica.</strong> Esquecer idempotência, DLQ e o que acontece se o consumidor ficar para trás.</li>
+  <li><strong>Escolher a sharding key sem olhar as queries.</strong></li>
+</ul>
 
 <h2 id="simulacao">Simulação: "Nosso app vai crescer 100×. O que você muda?"</h2>
 <div class="dialog">
@@ -237,7 +515,8 @@ func (c *LRU[V]) GetOrLoad(key string, load func(string) (V, error)) (V, error) 
 
 <h2 id="recursos">Vídeos e leituras</h2>
 <ul class="links">
-  <li class="video"><a href="https://www.youtube.com/results?search_query=bytebytego+scale+from+zero+to+millions+of+users" target="_blank" rel="noopener">ByteByteGo: Scale from zero to millions of users</a><small>Busca no YouTube pelos vídeos do canal do autor do livro sobre este capítulo.</small></li>
+  <li class="video"><a href="https://www.youtube.com/watch?v=iXnuWPsiMDE" target="_blank" rel="noopener">Scale From Zero To Millions Of Users (capítulo 1 do livro)</a><small>Walkthrough do capítulo do livro, passo a passo.</small></li>
+  <li class="video"><a href="https://www.youtube.com/watch?v=xpDnVSmNFX0" target="_blank" rel="noopener">Gaurav Sen: Horizontal vs. Vertical Scaling</a></li>
   <li class="video"><a href="https://www.youtube.com/watch?v=-W9F__D3oY4" target="_blank" rel="noopener">Harvard CS75: Scalability (David Malan)</a><small>Aula clássica sobre escala vertical/horizontal, cache, replicação e sharding.</small></li>
   <li class="read"><a href="https://github.com/donnemartin/system-design-primer#how-to-approach-a-system-design-interview-question" target="_blank" rel="noopener">System Design Primer: escalabilidade</a></li>
   <li class="read"><a href="https://aws.amazon.com/builders-library/" target="_blank" rel="noopener">Amazon Builders' Library</a><small>Artigos sobre caching, timeouts, retries e load shedding.</small></li>

@@ -22,6 +22,19 @@
 <li>Implementar o Snowflake em Go.</li>
 </ul></div>
 
+<h2 id="conceitos">Conceitos deste capítulo</h2>
+<div class="table-wrap"><table>
+<tr><th>Conceito</th><th>Definição</th></tr>
+<tr><td>Auto increment</td><td>Recurso do banco que atribui a cada nova linha o próximo inteiro de um contador.</td></tr>
+<tr><td>Multi-master replication</td><td>Vários servidores de banco aceitam escritas; para IDs, cada um usa auto increment com passo igual ao número de servidores.</td></tr>
+<tr><td>UUID</td><td>Identificador de 128 bits gerado localmente, com probabilidade de colisão desprezível.</td></tr>
+<tr><td>Ticket server</td><td>Um banco dedicado só a entregar números sequenciais para os outros servidores.</td></tr>
+<tr><td>Snowflake</td><td>Esquema do Twitter que monta um ID de 64 bits a partir de timestamp, identificadores de datacenter e máquina, e um contador.</td></tr>
+<tr><td>Epoch</td><td>O instante zero a partir do qual o timestamp é contado. Uma epoch própria (recente) aumenta a vida útil do ID.</td></tr>
+<tr><td>NTP</td><td><em>Network Time Protocol</em>: mantém os relógios das máquinas sincronizados, mas com erro de alguns milissegundos.</td></tr>
+<tr><td>Ordenável por tempo</td><td>Comparar dois IDs numericamente diz qual foi criado antes (aproximadamente).</td></tr>
+</table></div>
+
 <h2 id="requisitos">Requisitos</h2>
 <div class="dialog">
 <p class="c">Quais as características dos IDs?</p><p class="i">Únicos e ordenáveis.</p>
@@ -31,23 +44,57 @@
 <p class="c">Escala?</p><p class="i">10.000 IDs por segundo.</p>
 </div>
 
+<h2 id="por-que-dificil">Por que isso é um problema?</h2>
+<p>Num único banco, o <code>AUTO_INCREMENT</code> funciona porque existe um único lugar que sabe qual foi o último número. Quando os dados são particionados em 16 shards, cada shard tem seu próprio contador e todos começam em 1: o pedido 1 existe 16 vezes. Fazer todos consultarem um contador central resolve, mas transforma esse contador em gargalo e ponto único de falha para <em>toda</em> escrita do sistema.</p>
+<p>O objetivo, então, é gerar IDs que sejam únicos <strong>sem perguntar a ninguém</strong> a cada ID. Os requisitos típicos e o porquê de cada um:</p>
+<ul>
+  <li><strong>Únicos:</strong> óbvio, é a chave primária.</li>
+  <li><strong>Ordenáveis por tempo:</strong> permitem paginação por cursor ("me dê os posts com id &lt; X") e ordenação sem um campo <code>created_at</code> separado no índice.</li>
+  <li><strong>64 bits:</strong> cabem num <code>BIGINT</code>, são rápidos de comparar e indexar, e ocupam metade de um UUID em cada índice e chave estrangeira.</li>
+  <li><strong>Gerados localmente:</strong> latência zero e nenhuma dependência na escrita.</li>
+</ul>
+
+<h3>Por que a ordem importa para o banco</h3>
+<p>Índices de banco (B-trees) guardam as chaves ordenadas em páginas de alguns KB. Se o ID novo é sempre maior que os anteriores, toda inserção vai para a última página: ela fica na memória, enche e o banco abre outra. Com IDs aleatórios (UUIDv4), cada inserção cai num lugar aleatório do índice: o banco precisa trazer do disco uma página qualquer, que muitas vezes está cheia e precisa ser dividida (<em>page split</em>), deixando páginas pela metade. Em tabelas grandes, isso pode reduzir a vazão de inserção várias vezes e inchar o índice. É o principal motivo prático contra UUIDv4 como chave primária em bancos relacionais.</p>
+
 <h2 id="opcoes">As opções</h2>
 
 <h3>1. Multi-master replication</h3>
 <p>Cada um dos <em>k</em> servidores de banco usa auto_increment com passo <em>k</em>: o servidor 1 gera 1, 3, 5…; o servidor 2 gera 2, 4, 6…</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  W1[Servidor web] --> M1[("Banco 1: 1, 3, 5, 7…")]
+  W2[Servidor web] --> M2[("Banco 2: 2, 4, 6, 8…")]</pre>
+<figcaption>Com k = 2 bancos, cada um começa num número diferente e avança de 2 em 2: nunca colidem.</figcaption></figure>
 <div class="procon"><div class="pro"><h5>Prós</h5><ul><li>Simples, usa o banco</li></ul></div><div class="con"><h5>Contras</h5><ul><li>Difícil escalar para múltiplos DCs</li><li>IDs não crescem com o tempo entre servidores</li><li>Adicionar ou remover servidores muda o passo</li></ul></div></div>
 
 <h3>2. UUID</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  W1[Servidor web 1: gera UUID] --> DB[(Banco)]
+  W2[Servidor web 2: gera UUID] --> DB
+  W3[Servidor web 3: gera UUID] --> DB</pre>
+<figcaption>Cada servidor gera seus IDs sozinho, sem falar com ninguém. Exemplo: <code>09c93e62-50b4-468d-bf8a-c07e1040bfb2</code>.</figcaption></figure>
 <p>128 bits gerados localmente (v4 aleatório; v7 ordenado por tempo). A chance de colisão é desprezível: gerar 1 bilhão por segundo durante 100 anos para ter 50% de chance de uma duplicata.</p>
 <div class="procon"><div class="pro"><h5>Prós</h5><ul><li>Zero coordenação, cada servidor gera o seu</li><li>Escala trivialmente</li></ul></div><div class="con"><h5>Contras</h5><ul><li><strong>128 bits</strong> (requisito: 64)</li><li>UUIDv4 não é ordenável por tempo e espalha inserções no índice B-tree (pior desempenho de escrita)</li><li>Não numérico</li></ul></div></div>
 <div class="box tip"><strong class="t">Fora da entrevista</strong>UUIDv7 (RFC 9562) tem timestamp nos bits mais significativos e resolve a ordenação e a localidade no índice. É uma ótima escolha padrão quando 128 bits são aceitáveis.</div>
 
 <h3>3. Ticket server</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  W1[Servidor web] -->|"próximo ID?"| T[("Ticket server: auto_increment")]
+  W2[Servidor web] -->|"próximo ID?"| T
+  W3[Servidor web] -->|"próximo ID?"| T</pre>
+<figcaption>Todos dependem de um único servidor: simples e numérico, mas um ponto único de falha.</figcaption></figure>
 <p>Um banco central com auto_increment distribui IDs (abordagem do Flickr). Os servidores pedem IDs a ele, muitas vezes em <strong>blocos</strong> (pegue 1.000 de uma vez e distribua localmente).</p>
 <div class="procon"><div class="pro"><h5>Prós</h5><ul><li>IDs numéricos, simples</li><li>Bom para escala pequena e média</li></ul></div><div class="con"><h5>Contras</h5><ul><li><strong>Ponto único de falha</strong>; com vários ticket servers voltam os problemas de sincronização</li></ul></div></div>
 
 <h3>4. Twitter Snowflake</h3>
 <p>Dividir para conquistar: o ID de 64 bits é composto por seções.</p>
+<figure class="bits" style="margin:18px 0;overflow-x:auto"><div style="display:flex;min-width:560px;font-size:13px;text-align:center;border:1px solid var(--border);border-radius:8px;overflow:hidden">
+<div style="flex:1;padding:8px 2px;background:var(--bg-2)">0<br><small>1 bit<br>sinal</small></div>
+<div style="flex:41;padding:8px 2px;background:#dbeafe;color:#1e3a8a">timestamp<br><small>41 bits · ms desde a epoch</small></div>
+<div style="flex:5;padding:8px 2px;background:#dcfce7;color:#14532d">DC<br><small>5 bits</small></div>
+<div style="flex:5;padding:8px 2px;background:#fef3c7;color:#78350f">máquina<br><small>5 bits</small></div>
+<div style="flex:12;padding:8px 2px;background:#f3e8ff;color:#581c87">sequência<br><small>12 bits</small></div>
+</div><figcaption>As larguras são proporcionais ao número de bits: o tempo ocupa quase dois terços do ID.</figcaption></figure>
 <div class="table-wrap"><table>
 <tr><th>Bits</th><th>Seção</th><th>Descrição</th></tr>
 <tr><td>1</td><td>Sinal</td><td>Sempre 0 (reservado; mantém o int64 positivo)</td></tr>
@@ -57,6 +104,29 @@
 <tr><td>12</td><td>Sequência</td><td>Incrementa a cada ID no mesmo ms e zera a cada novo ms. 2<sup>12</sup> = <strong>4096 IDs/ms por máquina</strong></td></tr>
 </table></div>
 <p>Capacidade: 4096 × 1000 = ~4 milhões de IDs/s <em>por máquina</em>, muito acima dos 10 mil exigidos. Os IDs são ordenáveis por tempo porque o timestamp está nos bits mais significativos.</p>
+
+<h3>Montando um ID, bit a bit</h3>
+<p>Com epoch em 2026-01-01 00:00 UTC, suponha que o gerador do datacenter 3, máquina 7, crie o 6º ID (sequência 5) no instante 2026-01-12 13:46:40 UTC, ou seja, 1.000.000.000 ms depois da epoch.</p>
+<pre><code class="language-text">id = (timestamp &lt;&lt; 22) | (datacenter &lt;&lt; 17) | (máquina &lt;&lt; 12) | sequência
+   = (1000000000 &lt;&lt; 22) | (3 &lt;&lt; 17) | (7 &lt;&lt; 12) | 5
+   = 4194304000421893
+
+Em binário (64 bits, agrupado por seção):
+0 | 00000000000111011100110101100101000000000 | 00011 | 00111 | 000000000101
+s |              timestamp (41)               | dc(5) | maq(5)|  seq (12)</code></pre>
+<p>Os deslocamentos vêm da soma dos bits à direita de cada campo: o timestamp tem 5 + 5 + 12 = 22 bits abaixo dele; o datacenter, 5 + 12 = 17; a máquina, 12. Para decodificar, faz-se o caminho inverso com deslocamento e máscara:</p>
+<pre><code class="language-text">timestamp  = id &gt;&gt; 22            = 1000000000  → 2026-01-12 13:46:40 UTC
+datacenter = (id &gt;&gt; 17) &amp; 0x1F   = 3
+máquina    = (id &gt;&gt; 12) &amp; 0x1F   = 7
+sequência  = id &amp; 0xFFF          = 5</code></pre>
+<p>Isso tem uma consequência útil e outra perigosa. Útil: qualquer ID diz quando e onde foi criado, o que ajuda muito a depurar. Perigosa: qualquer pessoa que veja um ID público descobre o momento exato da criação (e, comparando IDs, uma estimativa da taxa de criação). Se isso for sensível, não exponha o ID interno.</p>
+
+<h3>Os limites, calculados</h3>
+<ul>
+  <li><strong>Vida útil:</strong> 2<sup>41</sup> ms = 2,2 × 10<sup>12</sup> ms ≈ 69,7 anos a partir da epoch. Com epoch em 2026, o problema chega em ~2095.</li>
+  <li><strong>Máquinas:</strong> 2<sup>10</sup> = 1.024 geradores simultâneos no total.</li>
+  <li><strong>Vazão por máquina:</strong> 4.096 por ms. Se esgotar, o gerador espera virar o milissegundo (no máximo 1 ms de espera).</li>
+</ul>
 
 <h2 id="comparacao">Comparação</h2>
 <div class="table-wrap"><table>
@@ -204,6 +274,18 @@ func Parts(id int64) (ts time.Time, datacenter, machine, sequence int64) {
 <p>Cada instância precisa de um ID único de 0 a 31. Fixar em config é frágil com autoscaling. Melhor: registrar-se no <strong>ZooKeeper/etcd</strong> e obter um ID livre com lease (liberado se a instância morrer), ou derivar do ordinal de um StatefulSet do Kubernetes.</p>
 <h3>Ajustando os bits</h3>
 <p>Poucos DCs e máquinas, mas muita concorrência? Tire bits de DC/máquina e dê à sequência. Precisa de mais tempo de vida? Use segundos em vez de ms (mas a sequência precisa de mais bits). A epoch customizada (por exemplo, a data de lançamento do produto) maximiza a vida útil.</p>
+<h3>Alternativa sem relógio: alocação por faixas (segmentos)</h3>
+<p>Uma evolução do ticket server elimina o gargalo sem depender de relógios. Uma tabela guarda, para cada tipo de ID, o maior valor já reservado:</p>
+<pre><code class="language-sql">UPDATE id_ranges SET max_id = max_id + 1000 WHERE name = 'orders' RETURNING max_id;
+-- devolve 51000: este servidor pode usar 50001..51000 sem falar com ninguém</code></pre>
+<ul>
+  <li>Cada servidor reserva uma faixa de 1.000 (ou 100 mil) IDs de uma vez e as distribui da memória. O banco recebe uma consulta por faixa, não por ID.</li>
+  <li><strong>Buffer duplo:</strong> quando 10–20% da faixa atual foi usada, o servidor já reserva a próxima em segundo plano, para nunca esperar pelo banco no caminho crítico.</li>
+  <li><strong>Se o banco cair</strong>, os servidores continuam gerando pelo que resta das faixas em memória (minutos de folga, dependendo do tamanho da faixa).</li>
+  <li><strong>Custo:</strong> se um servidor reinicia, a faixa não usada é perdida (buracos na sequência, o que normalmente é aceitável), e IDs de servidores diferentes não são ordenados por tempo entre si.</li>
+</ul>
+<p>Esse modelo é usado em produção por empresas como a Meituan (projeto Leaf) e é uma boa resposta quando o entrevistador pergunta "e se não puder confiar nos relógios?".</p>
+
 <h3>Alta disponibilidade</h3>
 <p>Geradores são stateless (fora o machine ID). Podem ser uma biblioteca embutida em cada serviço (latência zero) ou um serviço dedicado com várias instâncias.</p>
 <h3>Ordenação não é estrita</h3>
@@ -248,7 +330,7 @@ func Parts(id int64) (ts time.Time, datacenter, machine, sequence int64) {
 <li class="read"><a href="https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c" target="_blank" rel="noopener">Instagram: Sharding &amp; IDs at Instagram</a></li>
 <li class="read"><a href="https://code.flickr.net/2010/02/08/ticket-servers-distributed-unique-primary-keys-on-the-cheap/" target="_blank" rel="noopener">Flickr: Ticket Servers</a></li>
 <li class="read"><a href="https://www.rfc-editor.org/rfc/rfc9562" target="_blank" rel="noopener">RFC 9562: UUIDv7</a></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=design+unique+id+generator+distributed+system+snowflake" target="_blank" rel="noopener">Vídeos: unique ID generator</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=g3BV_holJK4" target="_blank" rel="noopener">Unique ID generator distribuído (Snowflake)</a></li>
 </ul>
 
 </article>

@@ -22,12 +22,40 @@
 <li>Evitar os erros que mais reprovam candidatos.</li>
 </ul></div>
 
+<h2 id="conceitos">Conceitos deste capítulo</h2>
+<div class="table-wrap"><table>
+<tr><th>Conceito</th><th>Definição</th></tr>
+<tr><td>Requisitos funcionais</td><td>O que o sistema faz (publicar post, ver feed).</td></tr>
+<tr><td>Requisitos não funcionais</td><td>Como ele precisa se comportar: escala, latência, disponibilidade, consistência, durabilidade.</td></tr>
+<tr><td>Design de alto nível</td><td>Visão de ponta a ponta com os principais componentes e como os dados fluem entre eles.</td></tr>
+<tr><td>Buy-in</td><td>Concordância da pessoa entrevistadora com o rumo, antes de aprofundar.</td></tr>
+<tr><td>Deep dive</td><td>Aprofundar um componente crítico, discutindo opções, trade-offs e falhas.</td></tr>
+<tr><td>Trade-off</td><td>Ganhar algo abrindo mão de outra coisa (latência × consistência, custo × velocidade).</td></tr>
+<tr><td>Gargalo</td><td>O componente que limita a capacidade do sistema inteiro.</td></tr>
+</table></div>
+
 <h2 id="visao">Visão geral e tempo</h2>
 <figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
   A["1. Entender o problema e definir escopo: 3–10 min"] --> B["2. Design de alto nível e buy-in: 10–15 min"]
   B --> C["3. Deep dive: 10–25 min"]
   C --> D["4. Fechamento: 3–5 min"]</pre>
 <figcaption>Para uma entrevista de 45 minutos. Em 60 minutos, o deep dive ganha mais tempo.</figcaption></figure>
+
+<h2 id="avaliacao">O que está sendo avaliado</h2>
+<p>Entender o critério muda como você usa o tempo. Empresas grandes avaliam, com nomes diferentes, quatro coisas:</p>
+<div class="table-wrap"><table>
+<tr><th>Dimensão</th><th>O que eles observam</th><th>Sinal forte</th><th>Sinal fraco</th></tr>
+<tr><td>Navegação do problema</td><td>Você transforma um pedido vago em requisitos e prioridades?</td><td>Corta escopo, pergunta escala e consistência, foca no que importa</td><td>Começa a desenhar sem perguntar; tenta resolver tudo</td></tr>
+<tr><td>Design de solução</td><td>O design funciona de ponta a ponta e atende aos requisitos?</td><td>Componentes justificados, fluxos completos, dados bem modelados</td><td>Caixas soltas, fluxos que não fecham, tecnologia sem motivo</td></tr>
+<tr><td>Profundidade técnica</td><td>Você conhece os detalhes onde eles importam?</td><td>Discute trade-offs concretos, falhas, números</td><td>Fica em "coloca um cache" sem dizer o quê, como e por quê</td></tr>
+<tr><td>Comunicação</td><td>Dá para trabalhar com você?</td><td>Pensa em voz alta, checa alinhamento, aceita sugestões</td><td>Silêncio longo; defende uma ideia ruim; não escuta as dicas</td></tr>
+</table></div>
+<h3>O que muda com o nível</h3>
+<ul>
+  <li><strong>Pleno:</strong> esperam um design funcional e correto, com alguma profundidade quando provocado. Tudo bem a pessoa entrevistadora conduzir os deep dives.</li>
+  <li><strong>Sênior:</strong> esperam que você conduza: escolha sozinho os pontos difíceis, antecipe falhas e gargalos e compare alternativas com trade-offs claros.</li>
+  <li><strong>Staff+:</strong> além disso, visão de operação e evolução: custo, migração, como o sistema muda em 2 anos, o que você <em>não</em> construiria, e por quê.</li>
+</ul>
 
 <h2 id="passo1">Passo 1: entender o problema e definir o escopo</h2>
 <p>O erro número um é sair desenhando. Responder rápido não dá pontos extras: o sinal que conta é a <strong>capacidade de transformar um pedido vago em requisitos claros</strong>. Pergunte, escreva as respostas e, quando a pessoa entrevistadora devolver "o que você acha?", faça premissas razoáveis e anote.</p>
@@ -71,6 +99,27 @@ GET  /v1/feed?cursor=…&amp;limit=20                        → 200 { posts[], 
 <li>Faça as estimativas que importam para as escolhas (veja o <a href="02-estimativas.html">capítulo 2</a>).</li>
 <li><strong>Peça buy-in</strong>: "isso cobre os requisitos? Faz sentido eu aprofundar em X?".</li>
 </ol>
+<h3>Como desenhar a API</h3>
+<ul>
+  <li>Uma rota por requisito funcional. Se você listou 3 funcionalidades, devem existir pelo menos 3 rotas.</li>
+  <li>REST é o padrão seguro. Use WebSocket/SSE para push em tempo real (chat, notificações ao vivo) e gRPC para comunicação entre serviços internos.</li>
+  <li>O usuário vem do token de autenticação, nunca do corpo: <code>POST /posts</code>, não <code>POST /posts {user_id}</code>. Isso mostra cuidado com segurança.</li>
+  <li>Listas são paginadas. Prefira <strong>cursor</strong> (<code>?cursor=&lt;último id visto&gt;</code>) a <code>offset</code>: offset fica lento em páginas profundas e pula ou repete itens quando entram itens novos.</li>
+  <li>Operações que não podem ser duplicadas (pagamento, envio) aceitam uma <strong>idempotency key</strong>.</li>
+</ul>
+
+<h3>Como escolher o banco no modelo de dados</h3>
+<p>Para cada entidade, responda três perguntas e a escolha costuma sair sozinha:</p>
+<ol>
+  <li><strong>Como ela é lida?</strong> Por chave? Por intervalo? Com joins? Com busca textual?</li>
+  <li><strong>Quanto volume e quantas escritas?</strong> Cabe num primário ou precisa particionar?</li>
+  <li><strong>Que consistência precisa?</strong> Transação entre várias linhas (saldo, estoque) ou eventual?</li>
+</ol>
+<p>Exemplo: usuários e seguidores (relações, volume moderado) → Postgres. Posts (muito volume, lidos por id ou por autor + tempo) → Cassandra/DynamoDB ou Postgres particionado. Fotos → S3. Feed pré-computado → Redis. Busca → Elasticsearch. Não tenha medo de usar mais de um banco, desde que cada um tenha um motivo. O guia completo está em <a href="ferramentas.html">Qual ferramenta usar?</a></p>
+
+<h3>Como percorrer os fluxos</h3>
+<p>Depois de desenhar, conte a história de uma requisição, numerando as setas: "1. o app chama <code>POST /posts</code> no LB; 2. o serviço de posts grava no banco; 3. publica um evento na fila; 4. o worker de fanout lê os seguidores e…". Fazer isso em voz alta revela buracos no seu desenho (de onde vem esse dado?) antes que a pessoa entrevistadora os encontre.</p>
+
 <div class="box warn"><strong class="t">Não otimize cedo</strong>
 Não comece por sharding, Kafka e Kubernetes. Primeiro faça funcionar de ponta a ponta. Depois identifique os gargalos <em>com base nos números</em> e evolua. Mostrar essa evolução já é um sinal forte.</div>
 
@@ -86,6 +135,33 @@ Não comece por sharding, Kafka e Kubernetes. Primeiro faça funcionar de ponta 
 <tr><td>Ticketmaster</td><td>Concorrência em reservas, pico de demanda, fila virtual</td></tr>
 </table></div>
 <p>Em cada deep dive, cubra: <strong>modelo de dados e acesso</strong>, <strong>escala</strong> (onde particionar? hotspots?), <strong>consistência</strong> e <strong>falhas</strong> (o que acontece se X cair? retry? idempotência?). Não gaste 10 minutos explicando um algoritmo de hash que ninguém pediu.</p>
+
+<h3>A estrutura de um bom deep dive</h3>
+<p>Para cada ponto que você aprofundar, siga este roteiro de quatro partes:</p>
+<ol>
+  <li><strong>O problema, com número:</strong> "temos 300 mil leituras de feed por segundo; montar o feed na hora exige consultar centenas de autores por leitura."</li>
+  <li><strong>Duas ou três opções:</strong> "posso montar na leitura (pull), pré-computar na escrita (push), ou um híbrido."</li>
+  <li><strong>Trade-offs de cada uma, ligados aos requisitos:</strong> "pull é simples e barato na escrita, mas a leitura fica lenta; push dá leitura O(1), mas um post de celebridade gera milhões de escritas."</li>
+  <li><strong>Decisão e consequências:</strong> "como a leitura precisa ser &lt; 200 ms, vou de push, com pull só para contas com mais de 100 mil seguidores. O custo é ter dois caminhos de código."</li>
+</ol>
+<p>Esse padrão (problema → opções → trade-offs → decisão) é exatamente o "sinal de profundidade" que a rubrica procura.</p>
+
+<h3>Checklist de falhas</h3>
+<p>Para cada componente do desenho, pergunte a si mesmo:</p>
+<ul>
+  <li>Se ele cair, o que para de funcionar? Existe réplica? Quanto tempo leva o failover?</li>
+  <li>Se ele ficar <em>lento</em> (pior que cair), quem espera por ele? Há timeout? Circuit breaker?</li>
+  <li>Se uma mensagem for entregue duas vezes, o resultado continua certo? (idempotência)</li>
+  <li>Se uma mensagem se perder, alguém percebe? (retry, reconciliação)</li>
+  <li>Se o tráfego vier 10× maior num minuto, o que satura primeiro?</li>
+</ul>
+
+<h3>Quando você travar</h3>
+<ul>
+  <li><strong>Diga o que está pensando:</strong> "estou em dúvida entre X e Y por causa de Z". A pessoa entrevistadora não pode ajudar com o que não ouve.</li>
+  <li><strong>Volte aos requisitos:</strong> quase sempre a decisão sai deles ("priorizamos disponibilidade, então…").</li>
+  <li><strong>Escolha o simples e siga em frente,</strong> anotando o ponto para revisitar. Ficar 5 minutos parada custa mais que uma decisão subótima e explícita.</li>
+</ul>
 
 <h2 id="passo4">Passo 4: fechamento</h2>
 <p>Nos minutos finais:</p>
@@ -158,6 +234,47 @@ Não comece por sharding, Kafka e Kubernetes. Primeiro faça funcionar de ponta 
 <p class="n">Repare: a candidata cortou o escopo, confirmou premissas, transformou não funcionais em decisões ("vai para object storage", "pré-computado") e só então avançou.</p>
 </div>
 
+<h2 id="exemplo-completo">O resto da entrevista do Instagram, aplicando o framework</h2>
+<p>Para ver o framework inteiro funcionando, aqui está como os outros passos poderiam ficar.</p>
+<h3>API</h3>
+<pre><code class="language-http">POST /v1/media/upload-url                    → 200 { upload_url, media_id }   # URL pré-assinada do S3
+POST /v1/posts         { media_id, caption } → 201 { post_id }
+POST /v1/users/{id}/follow                   → 204
+POST /v1/posts/{id}/likes                    → 204   # idempotente: curtir duas vezes = uma curtida
+GET  /v1/feed?cursor=…&amp;limit=20             → 200 { posts[], next_cursor }</code></pre>
+<p>O upload vai direto do app para o S3 por uma URL pré-assinada: os bytes da foto nunca passam pelos servidores de aplicação, que só lidam com metadados.</p>
+<h3>Modelo de dados</h3>
+<div class="table-wrap"><table>
+<tr><th>Entidade</th><th>Onde</th><th>Chave / acesso</th></tr>
+<tr><td>users</td><td>Postgres</td><td>por id</td></tr>
+<tr><td>follows (seguidor, seguido)</td><td>Postgres ou Cassandra</td><td>dois índices: "quem eu sigo" e "quem me segue"</td></tr>
+<tr><td>posts</td><td>Cassandra</td><td>partição por <code>author_id</code>, ordenado por <code>post_id</code> (que já embute o tempo; veja <a href="07-unique-id.html">IDs únicos</a>)</td></tr>
+<tr><td>likes</td><td>Cassandra + contador em Redis</td><td>(post_id, user_id) único; contagem agregada à parte</td></tr>
+<tr><td>feed</td><td>Redis</td><td>lista dos últimos ~500 post_ids por usuário</td></tr>
+<tr><td>fotos</td><td>S3 + CDN</td><td>por media_id, em vários tamanhos</td></tr>
+</table></div>
+<h3>Alto nível</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  App -->|1. pede URL| API[API / serviço de posts]
+  App -->|2. envia foto| S3[(S3)]
+  S3 --> T[Workers: redimensionar] --> S3
+  App -->|3. cria post| API
+  API --> P[(Posts: Cassandra)]
+  API -->|evento| Q[[Fila]] --> F[Fanout workers]
+  F --> G[(Grafo de follows)]
+  F --> R[(Feeds: Redis)]
+  App -->|GET /feed| FS[Serviço de feed] --> R
+  FS --> P
+  App -->|imagens| CDN --> S3</pre></figure>
+<h3>Deep dives que a candidata escolheria</h3>
+<ol>
+  <li><strong>Fanout e celebridades:</strong> híbrido push/pull, como no capítulo de <a href="11-news-feed.html">News feed</a>.</li>
+  <li><strong>Contagem de curtidas:</strong> um post viral recebe milhares de curtidas por segundo na mesma linha. Gravar cada curtida como linha única (garante idempotência) e manter o contador agregado no Redis, persistido em lotes.</li>
+  <li><strong>Mídia:</strong> pipeline assíncrono de redimensionamento, vários tamanhos por tela, CDN com URLs imutáveis.</li>
+</ol>
+<h3>Fechamento</h3>
+<p>"O principal risco é o Redis de feeds: se perdê-lo, os feeds podem ser reconstruídos a partir dos posts, mas isso é caro, então ele roda replicado. Monitoraria latência p99 do feed, atraso do fanout (tempo entre postar e aparecer) e tamanho da fila. Com 10× de escala, o grafo de follows vira o próximo gargalo e precisaria de cache dedicado."</p>
+
 <h2 id="quiz">Quiz</h2>
 <div class="quiz" data-answer="2"><div class="q">Qual é a primeira coisa a fazer ao receber o enunciado?</div>
 <button class="opt">Desenhar o diagrama de alto nível</button><button class="opt">Calcular QPS e armazenamento</button><button class="opt">Fazer perguntas para definir escopo e requisitos</button><button class="opt">Escolher o banco de dados</button>
@@ -172,7 +289,7 @@ Não comece por sharding, Kafka e Kubernetes. Primeiro faça funcionar de ponta 
 <h2 id="recursos">Vídeos e leituras</h2>
 <ul class="links">
 <li class="read"><a href="https://www.hellointerview.com/learn/system-design/in-a-hurry/delivery" target="_blank" rel="noopener">Hello Interview: Delivery framework</a><small>Um framework parecido, com ênfase em entidades e APIs.</small></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=system+design+interview+framework+step+by+step+bytebytego" target="_blank" rel="noopener">ByteByteGo: framework da entrevista</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=i7twT3x5yv8" target="_blank" rel="noopener">ByteByteGo: System Design Interview — a step-by-step guide</a></li>
 <li class="video"><a href="https://www.youtube.com/@hello_interview" target="_blank" rel="noopener">Hello Interview (canal)</a><small>Mock interviews completas, feitas por ex-entrevistadores de big techs.</small></li>
 <li class="course"><a href="https://www.tryexponent.com/courses/system-design-interview" target="_blank" rel="noopener">Exponent: System Design Interview course</a><small>Muitas mock interviews em vídeo.</small></li>
 </ul>

@@ -1,21 +1,21 @@
 # System Design na Prática
 
-Site de estudos responsivo, em português, para aprender **System Design** de verdade e se preparar para entrevistas de emprego.
+Site de estudos responsivo, em português, para aprender **System Design** de verdade.
 
-A sequência segue os temas do livro *System Design Interview – An Insider's Guide* (Alex Xu, Vol. 1), com muito material extra: um guia de **quando usar cada ferramenta**, conceitos de sistemas distribuídos, simulações de entrevista e exercícios. Os exemplos de implementação são em **Go**, com testes.
+A sequência segue os temas do livro *System Design Interview – An Insider's Guide* (Alex Xu, Vol. 1), com muito material extra: um guia de **quando usar cada ferramenta**, conceitos de sistemas distribuídos, simulações e exercícios. Os exemplos de implementação são em **Go**, com testes.
 
 ## O que tem aqui
 
 | Seção | Conteúdo |
 |---|---|
-| **Fundamentos** | Escalar de zero a milhões de usuários · estimativas (com calculadora) · framework de 4 passos para a entrevista |
+| **Fundamentos** | Escalar de zero a milhões de usuários · estimativas (com calculadora) · framework de 4 passos |
 | **Blocos de construção** | *Qual ferramenta usar?* (SQL, NoSQL, Redis, Kafka × RabbitMQ × SQS, S3, Elasticsearch, OLAP, protocolos…) · sistemas distribuídos (CAP, PACELC, consistência, quórum, Raft, idempotência, sagas, outbox) |
 | **12 estudos de caso** | Rate limiter · consistent hashing · key-value store · IDs únicos · encurtador de URL · web crawler · notificações · news feed · chat · autocomplete · YouTube · Google Drive |
-| **Simulador** | 25 entrevistas (11 do livro + 14 frequentes em big techs: Uber, Ticketmaster, pagamentos, leaderboard, Yelp, top-K, métricas, Kafka, hotel, Google Docs, job scheduler, ad clicks, cache distribuído, Instagram) com cronômetro, respostas do entrevistador, resposta-modelo por fase, perguntas-surpresa e rubrica |
+| **Simulador** | 25 system designs (11 do livro + 14 frequentes em big techs: Uber, Ticketmaster, pagamentos, leaderboard, Yelp, top-K, métricas, Kafka, hotel, Google Docs, job scheduler, ad clicks, cache distribuído, Instagram) com cronômetro, respostas do entrevistador, resposta-modelo por fase, perguntas-surpresa e rubrica |
 | **Exercícios** | 112 exercícios: estimativas, conceitos, "qual ferramenta?", trade-offs, mini-designs e código Go |
-| **Referência** | Cola para o dia da entrevista · cursos, vídeos, livros, papers e blogs · glossário |
+| **Referência** | Cursos, vídeos, livros, papers e blogs · glossário |
 
-Cada estudo de caso traz requisitos, estimativas, API, diagramas (Mermaid), deep dives com trade-offs, código Go, um diálogo simulado de entrevista, perguntas de follow-up, quiz e links.
+Cada estudo de caso traz requisitos, estimativas, API, diagramas (Mermaid), deep dives com trade-offs, código Go, um diálogo simulado de system design, perguntas de follow-up, quiz e links.
 
 Progresso (tópicos estudados, quizzes, simulações, exercícios e anotações) fica salvo no `localStorage` do navegador.
 

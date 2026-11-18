@@ -22,6 +22,27 @@
 <li>Rodar uma simulação de quórum e de conflitos em Go.</li>
 </ul></div>
 
+<h2 id="conceitos">Conceitos deste capítulo</h2>
+<div class="table-wrap"><table>
+<tr><th>Conceito</th><th>Definição</th></tr>
+<tr><td>Key-value store</td><td>Banco que guarda pares (chave única → valor opaco) e oferece basicamente <code>put(chave, valor)</code> e <code>get(chave)</code>.</td></tr>
+<tr><td>Teorema CAP</td><td>Diante de uma partição de rede, um sistema distribuído precisa escolher entre consistência e disponibilidade; não dá para ter as três propriedades ao mesmo tempo.</td></tr>
+<tr><td>Consistência (C)</td><td>Todos os clientes veem o mesmo dado ao mesmo tempo, não importa a qual nó se conectem.</td></tr>
+<tr><td>Disponibilidade (A)</td><td>Toda requisição recebe resposta, mesmo com nós fora do ar.</td></tr>
+<tr><td>Tolerância a partição (P)</td><td>O sistema continua operando mesmo quando a rede impede alguns nós de se comunicarem.</td></tr>
+<tr><td>Consistência forte / fraca / eventual</td><td>Forte: toda leitura vê a última escrita. Fraca: leituras podem não ver. Eventual: se as escritas pararem, todas as réplicas acabam convergindo.</td></tr>
+<tr><td>Quórum (N, W, R)</td><td>N réplicas por chave; a escrita só é confirmada após W confirmações e a leitura espera R respostas.</td></tr>
+<tr><td>Coordenador</td><td>O nó que recebe a requisição do cliente e fala com as réplicas em nome dele.</td></tr>
+<tr><td>Versionamento</td><td>Tratar cada modificação como uma nova versão imutável, para poder detectar e resolver conflitos.</td></tr>
+<tr><td>Vector clock</td><td>Lista de pares [servidor, contador] anexada a cada versão, que permite saber se uma versão descende da outra ou se são concorrentes.</td></tr>
+<tr><td>Gossip</td><td>Protocolo em que cada nó troca periodicamente o que sabe com alguns nós aleatórios, espalhando a informação pelo cluster como um boato.</td></tr>
+<tr><td>Sloppy quorum</td><td>Quórum formado pelos primeiros nós <em>saudáveis</em> do anel, não necessariamente as réplicas oficiais da chave.</td></tr>
+<tr><td>Hinted handoff</td><td>Um nó substituto guarda a escrita destinada a um nó fora do ar e a repassa quando ele voltar.</td></tr>
+<tr><td>Anti-entropy / Merkle tree</td><td>Processo que compara réplicas e corrige diferenças; a Merkle tree (árvore de hashes) permite achar as diferenças trocando poucos dados.</td></tr>
+<tr><td>Commit log, memtable, SSTable</td><td>Log de escritas em disco para durabilidade; estrutura ordenada em memória; arquivo imutável e ordenado gravado quando a memtable enche.</td></tr>
+<tr><td>Bloom filter</td><td>Estrutura compacta que responde "com certeza não está" ou "talvez esteja" para um conjunto.</td></tr>
+</table></div>
+
 <h2 id="requisitos">Requisitos</h2>
 <ul>
 <li>Operações <code>put(key, value)</code> e <code>get(key)</code>; pares pequenos (menos de 10 KB).</li>
@@ -35,6 +56,26 @@
 
 <h2 id="cap">Escolhendo no CAP</h2>
 <p>Com 3 réplicas n1, n2, n3, se n3 fica isolado por uma partição de rede:</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart TB
+  C((Consistência)) --- A((Disponibilidade))
+  A --- P((Tolerância a partição))
+  P --- C
+  C -.- CP["CP: abre mão da disponibilidade (HBase, MongoDB, bancos com consenso)"]
+  A -.- AP["AP: abre mão da consistência imediata (Cassandra, DynamoDB, Dynamo)"]
+  C -.- CA["CA: só existe sem rede, ou seja, não existe em sistemas distribuídos reais"]</pre>
+<figcaption>Como partições de rede vão acontecer, a escolha real é entre CP e AP no momento da falha.</figcaption></figure>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  subgraph Lado1[Lado que continua conectado]
+    N1((n1)) <--> N2((n2))
+  end
+  subgraph Lado2[Isolado]
+    N3((n3))
+  end
+  N1 x--x N3
+  N2 x--x N3
+  CL1[Cliente] -->|"escreve x = 2"| N1
+  CL2[Cliente] -->|"lê x"| N3</pre>
+<figcaption>Partição de rede: n3 não recebe a escrita feita em n1. CP recusa a escrita (ou a leitura em n3); AP aceita as duas, e o cliente de n3 lê o valor antigo.</figcaption></figure>
 <ul>
 <li><strong>CP:</strong> bloqueia as escritas em n1 e n2 (não dá para garantir que n3 as receba), e o sistema fica indisponível para escrita. Bancos e saldos querem isso.</li>
 <li><strong>AP:</strong> continua aceitando leituras e escritas (n3 pode servir dado velho) e sincroniza quando a partição terminar. O Dynamo (carrinho de compras) escolheu AP: "adicionar ao carrinho" nunca pode falhar.</li>
@@ -49,6 +90,12 @@
 <h3 id="replicacao">2. Replicação</h3>
 <p>Cada chave é replicada nos <strong>N primeiros servidores físicos distintos</strong> no sentido horário do anel, de preferência em DCs/racks diferentes.</p>
 
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  K["chave k0 cai aqui no anel"] --> S1((s1: réplica 1))
+  S1 --> S2((s2: réplica 2))
+  S2 --> S3((s3: réplica 3))
+  S3 -.-> S4((s4: não guarda k0))</pre>
+<figcaption>Com N = 3, a chave fica no primeiro servidor no sentido horário e nos dois seguintes (pulando vnodes de um servidor já escolhido).</figcaption></figure>
 <h3 id="quorum">3. Consistência: quórum</h3>
 <figure class="mermaid-wrap"><pre class="mermaid">sequenceDiagram
   participant C as Cliente
@@ -69,6 +116,27 @@
 <li><strong>R=1, W=N</strong>: otimizado para leitura. <strong>W=1, R=N</strong>: otimizado para escrita.</li>
 <li><strong>W+R ≤ N</strong>: consistência eventual com latência mínima.</li>
 </ul>
+<h4>Por que W + R &gt; N garante ler a última escrita</h4>
+<p>Com N = 3 réplicas (A, B, C), uma escrita com W = 2 chegou a pelo menos 2 delas, digamos A e B. Uma leitura com R = 2 consulta pelo menos 2 réplicas. Quaisquer 2 de 3 têm pelo menos uma em comum com {A, B}: se ler A e C, A tem o valor novo; se ler B e C, B tem. Como 2 + 2 &gt; 3, os conjuntos <em>sempre</em> se cruzam. O coordenador compara as versões que recebeu e devolve a mais nova. Com W = 1 e R = 1 (1 + 1 ≤ 3), a leitura pode cair justamente numa réplica que ainda não recebeu a escrita.</p>
+<div class="table-wrap"><table>
+<tr><th>Configuração (N=3)</th><th>Latência de escrita</th><th>Latência de leitura</th><th>Tolera quantos nós fora</th><th>Uso típico</th></tr>
+<tr><td>W=2, R=2</td><td>2ª réplica mais rápida</td><td>2ª réplica mais rápida</td><td>1 para escrita e leitura</td><td>Padrão equilibrado</td></tr>
+<tr><td>W=3, R=1</td><td>a mais lenta das 3</td><td>a mais rápida</td><td>0 para escrita, 2 para leitura</td><td>Muita leitura, pouca escrita</td></tr>
+<tr><td>W=1, R=3</td><td>a mais rápida</td><td>a mais lenta</td><td>2 para escrita, 0 para leitura</td><td>Ingestão de eventos</td></tr>
+<tr><td>W=1, R=1</td><td>mínima</td><td>mínima</td><td>2</td><td>Métricas, dados que toleram ler valor velho</td></tr>
+</table></div>
+<div class="box warn"><strong class="t">Quórum não é transação</strong>
+W + R &gt; N dá uma garantia útil, mas mais fraca do que parece. Com <em>sloppy quorum</em> (abaixo), a escrita pode ter ido para nós "substitutos" fora do conjunto oficial, e a leitura pode não cruzar com eles. Duas escritas concorrentes ainda geram conflito. E uma escrita que falhou (só chegou a 1 réplica) não é desfeita: pode aparecer em leituras futuras. Se o requisito é "nunca ler dado velho" ou "compare-and-set", você precisa de um protocolo de consenso (Raft, Paxos), não só de quórum.</div>
+
+<h4>Uma leitura, passo a passo</h4>
+<ol>
+  <li>O cliente chama <code>get("cart:42")</code> em qualquer nó; ele vira o <strong>coordenador</strong>.</li>
+  <li>O coordenador calcula as 3 réplicas da chave no anel e envia a leitura a todas (ou a R delas, para economizar).</li>
+  <li>Espera as R primeiras respostas. Suponha que A devolva a versão <code>[A:3]</code> e B devolva <code>[A:2]</code>.</li>
+  <li>Compara os vector clocks: <code>[A:3]</code> descende de <code>[A:2]</code>, então é a mais nova. Devolve-a ao cliente.</li>
+  <li><strong>Read repair:</strong> em segundo plano, manda <code>[A:3]</code> para B, que estava atrasada.</li>
+  <li>Se as versões fossem concorrentes, devolveria as duas ("siblings") para o cliente reconciliar.</li>
+</ol>
 
 <h3 id="vector-clock">4. Resolução de conflitos: vector clocks</h3>
 <p>Em AP, dois clientes podem escrever na mesma chave em réplicas diferentes ao mesmo tempo. Como saber qual versão é a "correta"? Last-write-wins por timestamp é simples, mas <strong>perde escritas</strong> (os relógios entre máquinas não são confiáveis).</p>
@@ -81,6 +149,15 @@
 <li>D3 e D4 são <strong>concorrentes</strong> (nenhuma é ancestral da outra): <strong>conflito</strong>. O próximo cliente que ler recebe as duas versões, reconcilia (no carrinho, a união dos itens) e grava D5 = <code>[Sx:3, Sy:1, Sz:1]</code>.</li>
 </ol>
 <p>Regra: X é ancestral de Y se todo contador de X ≤ o contador correspondente de Y. Se em alguns é menor e em outros maior, são concorrentes.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  D1["D1 [Sx:1]"] -->|"escrita via Sx"| D2["D2 [Sx:2]"]
+  D2 -->|"escrita via Sy"| D3["D3 [Sx:2, Sy:1]"]
+  D2 -->|"escrita via Sz"| D4["D4 [Sx:2, Sz:1]"]
+  D3 -->|"cliente reconcilia, grava via Sx"| D5["D5 [Sx:3, Sy:1, Sz:1]"]
+  D4 --> D5</pre>
+<figcaption>A história das versões é um grafo: D3 e D4 nascem da mesma D2 sem conhecer uma à outra, e D5 as funde.</figcaption></figure>
+<h4>Como o conflito aparece, na prática</h4>
+<p>Duas réplicas têm <code>nome = "ana"</code>. Durante uma partição, um cliente grava <code>"ana.sp"</code> numa e outro grava <code>"ana.rj"</code> na outra. Sem versionamento, quando a rede voltar não há como saber qual veio "depois", e qualquer escolha automática perde uma das escritas. Com vector clocks, o sistema pelo menos <em>sabe</em> que as duas são concorrentes e pode entregar as duas para quem entende a regra de negócio decidir.</p>
 <p><strong>Desvantagens:</strong> complexidade empurrada para o cliente, que precisa reconciliar, e o vetor pode crescer (limite o tamanho e remova os pares mais antigos, o que o Dynamo considera aceitável na prática).</p>
 <div class="code-title">go/kvstore/vectorclock.go</div>
 <pre><code class="language-go" data-src="go/kvstore/vectorclock.go">// Package kvstore ilustra os blocos de um key-value store distribuído no
@@ -309,9 +386,35 @@ func latest(vs []Versioned) []Versioned {
 <li>Periodicamente incrementa o próprio contador e envia a lista a alguns nós aleatórios, que a repassam.</li>
 <li>Se o contador de um nó não aumenta por um tempo, ele é considerado offline. Exigir que mais de uma fonte confirme a queda evita falsos positivos.</li>
 </ul>
+<h4>Gossip, com números</h4>
+<div class="table-wrap"><table>
+<tr><th>Membro</th><th>Contador de heartbeat</th><th>Última atualização (local)</th></tr>
+<tr><td>s0</td><td>10232</td><td>12:00:01</td></tr>
+<tr><td>s1</td><td>10224</td><td>12:00:10</td></tr>
+<tr><td>s2</td><td>9908</td><td><strong>11:58:02</strong></td></tr>
+<tr><td>s3</td><td>10237</td><td>12:00:20</td></tr>
+</table></div>
+<p>Esta é a lista de membros vista por s0 às 12:00:22. Cada nó incrementa o próprio contador e manda a lista a alguns vizinhos aleatórios; quem recebe fica com o maior contador visto para cada membro. O contador de s2 não sobe há 2 minutos <em>em nenhuma das listas que chegam a s0</em>, então s0 o marca como suspeito e depois como fora do ar, e essa informação também se espalha por gossip.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  C[Coordenador] -->|"write k"| S1((s1))
+  C -->|"write k"| S3((s3))
+  C -. "s2 fora do ar" .-> S2((s2))
+  C -->|"write k + dica: entregar a s2"| S4((s4: substituto))
+  S4 -. "s2 voltou: repassa a escrita" .-> S2</pre>
+<figcaption>Sloppy quorum + hinted handoff: o quórum W é atingido com um substituto, que devolve os dados quando o dono volta.</figcaption></figure>
 <p><strong>Falhas temporárias: sloppy quorum + hinted handoff.</strong> Em vez de exigir as N réplicas "oficiais", o coordenador usa os primeiros W/R nós <em>saudáveis</em> do anel. Se s2 está fora, s3 recebe a escrita com uma "dica" (<em>hint</em>) e a entrega a s2 quando ele voltar.</p>
 <p><strong>Falhas permanentes: anti-entropy com Merkle trees.</strong> Para sincronizar réplicas sem comparar todas as chaves, cada réplica divide o espaço de chaves em buckets, calcula o hash de cada bucket e monta uma árvore de hashes. Comparando as raízes: se iguais, as réplicas estão sincronizadas; se diferentes, desce pelos filhos diferentes até achar os buckets divergentes. A quantidade de dados transferidos é proporcional às <em>diferenças</em>, não ao tamanho total.</p>
 <p><strong>Falha de datacenter:</strong> réplicas em vários DCs.</p>
+
+<h4>Merkle tree, com um exemplo</h4>
+<p>Duas réplicas guardam as chaves de um trecho do anel, divididas em 4 buckets. Cada folha da árvore é o hash do conteúdo de um bucket; cada nó interno é o hash dos dois filhos.</p>
+<pre><code class="language-text">Réplica A                         Réplica B
+            raiz: 9f2                         raiz: 4c1      ← diferentes: descer
+         /           \                     /           \
+     h12: a71      h34: 3be            h12: a71      h34: e05  ← só a direita difere
+     /    \        /    \              /    \        /    \
+  b1:11  b2:5c  b3:d4  b4:70        b1:11  b2:5c  b3:d4  b4:8a  ← bucket 4 difere</code></pre>
+<p>Comparando de cima para baixo, foram necessárias 3 comparações de hash para descobrir que só o bucket 4 diverge, e só as chaves desse bucket são trocadas. Com milhões de chaves e poucas diferenças, isso transforma uma comparação de terabytes em alguns KB de hashes. O custo: a árvore precisa ser recalculada quando as chaves mudam, e quando um nó entra ou sai os trechos mudam e as árvores daquele trecho precisam ser reconstruídas.</p>
 
 <h2 id="arquitetura">Arquitetura do sistema</h2>
 <figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
@@ -323,6 +426,14 @@ func latest(vs []Versioned) []Versioned {
   N2 <-. gossip .-> N3
   N3 <-. gossip .-> N1</pre>
 <figcaption>Sem nó mestre: todos os nós têm as mesmas responsabilidades e qualquer um pode ser coordenador.</figcaption></figure>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart TB
+  N[Cada nó do cluster] --> A1[API de cliente: get / put]
+  N --> A2[Detecção de falhas: gossip]
+  N --> A3[Resolução de conflitos: vector clocks]
+  N --> A4[Reparo: hinted handoff, anti-entropy]
+  N --> A5[Replicação]
+  N --> A6[Storage engine: LSM]</pre>
+<figcaption>Design descentralizado: todos os nós fazem tudo, então nenhum é especial.</figcaption></figure>
 <p>Cada nó cuida de: API de cliente, detecção de falhas, resolução de conflitos, reparo de falhas, replicação e storage engine. Não há ponto único de falha.</p>
 
 <h2 id="escrita">Caminho de escrita (LSM tree, como no Cassandra)</h2>
@@ -333,8 +444,38 @@ func latest(vs []Versioned) []Versioned {
 <li><strong>Compaction</strong> em background funde SSTables, remove versões antigas e tombstones.</li>
 </ol>
 <p>Tudo é escrita sequencial, por isso as LSM trees são tão rápidas para escrever (lembre: seek em disco é caro).</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  W[put k,v] --> CL[(Commit log: append)]
+  W --> MT[Memtable: ordenada em RAM]
+  MT -->|cheia: flush| S1[(SSTable nova)]
+  S1 --> CP{Compaction}
+  S2[(SSTable)] --> CP
+  S3[(SSTable)] --> CP
+  CP --> SM[(SSTable fundida)]</pre></figure>
+
+<h3>Os detalhes que fazem diferença</h3>
+<ul>
+  <li><strong>Memtable:</strong> geralmente uma <em>skip list</em> ou árvore balanceada, para manter as chaves ordenadas com inserção O(log n). Ordenar em memória é o que permite gravar a SSTable de uma vez, sequencialmente.</li>
+  <li><strong>Commit log:</strong> se o processo morre, a memtable (RAM) se perde; na reinicialização, o log é reaplicado. Depois que a memtable vira SSTable, o trecho correspondente do log pode ser descartado.</li>
+  <li><strong>SSTable por dentro:</strong> blocos de dados ordenados (alguns KB cada, comprimidos), um índice esparso com a primeira chave de cada bloco e o Bloom filter. Para achar uma chave: Bloom filter → busca binária no índice → lê um único bloco.</li>
+  <li><strong>Atualizar = escrever de novo:</strong> SSTables são imutáveis, então um update grava uma nova versão; a mais recente vence na leitura.</li>
+  <li><strong>Deletar = escrever um tombstone:</strong> não dá para apagar de um arquivo imutável. Grava-se um marcador "apagado" que esconde as versões antigas até a compaction removê-las. O tombstone precisa durar mais que o tempo máximo que uma réplica pode ficar fora (o <code>gc_grace</code> do Cassandra, 10 dias por padrão); se for removido antes, uma réplica que estava fora pode "ressuscitar" o dado apagado via anti-entropy.</li>
+</ul>
+<h3>Estratégias de compaction</h3>
+<div class="table-wrap"><table>
+<tr><th>Estratégia</th><th>Como funciona</th><th>Bom para</th><th>Custo</th></tr>
+<tr><td>Size-tiered</td><td>Junta SSTables de tamanho parecido quando há várias delas</td><td>Muita escrita</td><td>Leituras podem tocar muitos arquivos; precisa de espaço livre temporário de até 2× durante a fusão</td></tr>
+<tr><td>Leveled</td><td>Organiza em níveis (L0, L1, L2…), cada um ~10× maior; dentro de um nível, as chaves não se sobrepõem</td><td>Muita leitura</td><td>Reescreve os dados mais vezes (mais I/O de escrita)</td></tr>
+</table></div>
+<p>Esse é o trade-off clássico das LSM trees: <strong>amplificação de escrita</strong> (quantas vezes cada byte é regravado pela compaction), <strong>amplificação de leitura</strong> (quantos arquivos cada leitura toca) e <strong>amplificação de espaço</strong> (versões antigas ocupando disco). Não dá para minimizar os três ao mesmo tempo.</p>
 
 <h2 id="leitura">Caminho de leitura</h2>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  R[get k] --> M{"Está na memtable?"}
+  M -->|sim| OUT[Devolve]
+  M -->|não| BF["Bloom filters: quais SSTables podem ter k?"]
+  BF --> SS["Lê só essas SSTables, da mais nova para a mais antiga"]
+  SS --> OUT</pre></figure>
 <ol>
 <li>Procura na <strong>memtable</strong>; se achar, retorna.</li>
 <li>Senão, consulta o <strong>Bloom filter</strong> de cada SSTable para saber quais <em>podem</em> conter a chave, e evita ler as que certamente não têm.</li>
@@ -399,6 +540,18 @@ func (f *Filter) MightContain(s string) bool {
 	return true
 }</code></pre>
 
+<h3>Dimensionando o Bloom filter</h3>
+<p>A taxa de falso positivo depende de quantos bits você gasta por chave. Com ~10 bits por chave e 7 funções de hash, a taxa fica em ~1%; com ~14 bits, ~0,1%. Para uma SSTable com 10 milhões de chaves, 10 bits/chave dão 12,5 MB de filtro, que fica em memória. Em troca, 99% das leituras de chaves ausentes nesse arquivo não tocam o disco. Detalhes da fórmula estão no código acima.</p>
+
+<h2 id="estimativa">Estimativa: quantos nós?</h2>
+<p>Suponha 1 bilhão de carrinhos ativos, 5 KB cada, N = 3, e 100 mil operações/s no pico.</p>
+<ul>
+  <li>Dados brutos: 10<sup>9</sup> × 5 KB = 5 TB. Com 3 réplicas: 15 TB. Com folga para compaction e crescimento (~2×): 30 TB.</li>
+  <li>Com nós de 2 TB de SSD útil: <strong>~15 nós</strong> pelo armazenamento.</li>
+  <li>Vazão: cada operação com W=2/R=2 vira ~2–3 operações internas, ou seja, ~250 mil/s no cluster. Um nó Cassandra faz na ordem de 10–20 mil operações/s, então seriam <strong>~15–25 nós</strong> pela vazão.</li>
+</ul>
+<p>Os dois números são parecidos, e um cluster de ~25 nós distribuídos em 3 zonas atende. Na entrevista, mostrar que você dimensionou pelos dois eixos (espaço e vazão) e escolheu o maior é o sinal que importa.</p>
+
 <h2 id="resumo">Resumo: objetivo → técnica</h2>
 <div class="table-wrap"><table>
 <tr><th>Objetivo / problema</th><th>Técnica</th></tr>
@@ -453,7 +606,7 @@ func (f *Filter) MightContain(s string) bool {
 <li class="read"><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf" target="_blank" rel="noopener">Dynamo: Amazon's Highly Available Key-value Store (2007)</a><small>Leitura obrigatória: este capítulo é praticamente um resumo dele.</small></li>
 <li class="read"><a href="https://www.cs.cornell.edu/projects/ladis2009/papers/lakshman-ladis2009.pdf" target="_blank" rel="noopener">Cassandra: A Decentralized Structured Storage System</a></li>
 <li class="read"><a href="https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/" target="_blank" rel="noopener">Bigtable (Google)</a><small>Origem do modelo memtable/SSTable.</small></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=design+distributed+key+value+store+system+design+interview" target="_blank" rel="noopener">Vídeos: design de key-value store</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=6fOoXT1HYxk" target="_blank" rel="noopener">Exponent: Design a key-value store (mock interview)</a></li>
 <li class="course"><a href="https://pdos.csail.mit.edu/6.824/" target="_blank" rel="noopener">MIT 6.5840: lab de KV store com Raft em Go</a></li>
 </ul>
 

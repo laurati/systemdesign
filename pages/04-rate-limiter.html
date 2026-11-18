@@ -22,6 +22,21 @@
 <li>Implementar todos os algoritmos em Go.</li>
 </ul></div>
 
+<h2 id="conceitos">Conceitos deste capítulo</h2>
+<div class="table-wrap"><table>
+<tr><th>Conceito</th><th>Definição</th></tr>
+<tr><td>Rate limiter</td><td>Componente que conta quantas requisições um cliente (identificado por IP, usuário, API key…) fez num intervalo e bloqueia as que passarem do limite.</td></tr>
+<tr><td>Throttling</td><td>Desacelerar o cliente (atrasar ou enfileirar) em vez de rejeitar.</td></tr>
+<tr><td>HTTP 429</td><td><em>Too Many Requests</em>: a resposta padrão para uma requisição barrada pelo limite.</td></tr>
+<tr><td>Rajada (burst)</td><td>Muitas requisições num intervalo curto, acima da taxa média.</td></tr>
+<tr><td>Janela fixa</td><td>Intervalo de tempo alinhado ao relógio (12:00:00–12:00:59) usado para contar requisições.</td></tr>
+<tr><td>Janela deslizante</td><td>Intervalo que termina sempre "agora" (os últimos 60 s), recalculado a cada requisição.</td></tr>
+<tr><td>API gateway</td><td>Serviço na entrada da arquitetura que concentra funções transversais: autenticação, roteamento, terminação TLS, rate limiting.</td></tr>
+<tr><td>Middleware</td><td>Código que roda antes do handler de cada requisição dentro do próprio serviço.</td></tr>
+<tr><td>Race condition</td><td>Erro causado pela ordem imprevisível de operações concorrentes; aqui, duas requisições lendo o mesmo contador antes de qualquer uma incrementá-lo.</td></tr>
+<tr><td>Fail-open / fail-closed</td><td>O que fazer quando o próprio limitador falha: deixar tudo passar (open) ou bloquear tudo (closed).</td></tr>
+</table></div>
+
 <h2 id="por-que">Por que rate limiting?</h2>
 <ul>
 <li><strong>Evitar abuso e DoS</strong>, intencional ou acidental (um cliente com bug em loop).</li>
@@ -53,12 +68,29 @@
 <tr><td><strong>API gateway</strong></td><td>Centralizado, já existe na arquitetura de microsserviços, gerenciado (AWS API Gateway, Kong)</td><td>Menos flexível para regras de negócio específicas</td></tr>
 <tr><td>Middleware na aplicação</td><td>Controle total do algoritmo e das regras</td><td>Cada serviço precisa incluí-lo; esforço de engenharia</td></tr>
 </table></div>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  subgraph A["Opção 1: no servidor da API"]
+    C1[Cliente] --> S1["Servidor da API + rate limiter embutido"]
+  end
+  subgraph B["Opção 2: middleware / gateway na frente"]
+    C2[Cliente] --> RL[Rate limiter] --> S2[Servidores da API]
+    RL -->|"429"| C2
+  end</pre>
+<figcaption>O limitador do lado do cliente não aparece porque não é confiável: quem controla o cliente pode desligá-lo.</figcaption></figure>
+<p>Exemplo com limite de 2 requisições por segundo: as duas primeiras do segundo passam pelo middleware até a API; a terceira volta com 429 sem tocar nos servidores. É essa a vantagem de ficar na frente: o tráfego excedente custa quase nada.</p>
 <p><strong>Como decidir:</strong> considere a stack atual (já existe gateway?), se o algoritmo do gateway serve, e se há gente para construir e manter. Para a entrevista: middleware ou gateway com <strong>contadores num Redis compartilhado</strong>.</p>
 
 <h2 id="algoritmos">Os algoritmos</h2>
 
 <h3>1. Token bucket</h3>
 <p>Um balde de capacidade <em>C</em> é reabastecido a <em>r</em> tokens/s. Cada requisição consome um token; sem token, recebe 429. Dois parâmetros: tamanho do balde e taxa de reposição.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  R["Refiller: + r tokens/s (até a capacidade C)"] --> BK[("Balde: tokens disponíveis")]
+  REQ[Requisição chega] --> Q{"Há ≥ 1 token?"}
+  BK -.-> Q
+  Q -->|"sim: retira 1 token"| OK[Encaminha à API]
+  Q -->|"não"| DROP["Descarta: 429"]</pre>
+<figcaption>Token bucket: tokens entram a uma taxa fixa e transbordam se o balde estiver cheio; cada requisição precisa levar um.</figcaption></figure>
 <div class="procon"><div class="pro"><h5>Prós</h5><ul><li>Fácil de implementar, pouca memória</li><li><strong>Permite rajadas</strong> curtas (até C), o que é bom para uso humano</li></ul></div><div class="con"><h5>Contras</h5><ul><li>Ajustar 2 parâmetros não é trivial</li></ul></div></div>
 <p>Usado por Amazon e Stripe. Quantos baldes? Um por endpoint e por usuário (por exemplo, 1 post/s e 150 likes/dia), um por IP, ou um global (10 mil req/s no sistema).</p>
 <div class="code-title">go/ratelimit/tokenbucket.go</div>
@@ -127,6 +159,13 @@ func (tb *TokenBucket) Allow(key string) bool {
 
 <h3>2. Leaking bucket</h3>
 <p>Requisições entram numa fila FIFO de tamanho fixo e são processadas a uma taxa constante. Fila cheia: descarta.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  IN[Requisições em rajada] --> F{"Fila cheia?"}
+  F -->|"não"| Q[["Fila FIFO (tamanho fixo)"]]
+  F -->|"sim"| D["Descarta"]
+  Q -->|"saída a taxa constante: n por segundo"| P[Processamento]</pre>
+<figcaption>Leaking bucket: a entrada pode ser irregular, a saída é sempre no mesmo ritmo.</figcaption></figure>
+<p>Diferença em uma frase: o token bucket limita a <em>taxa média</em> e deixa rajadas passarem; o leaking bucket <em>alisa</em> o tráfego, entregando ao backend sempre o mesmo ritmo.</p>
 <div class="procon"><div class="pro"><h5>Prós</h5><ul><li>Saída <strong>estável</strong>: bom quando o backend precisa de vazão constante</li><li>Memória limitada</li></ul></div><div class="con"><h5>Contras</h5><ul><li>Uma rajada enche a fila com requisições antigas, e as novas são descartadas</li><li>2 parâmetros para ajustar</li></ul></div></div>
 <p>Usado pela Shopify.</p>
 <div class="code-title">go/ratelimit/leakybucket.go</div>
@@ -188,8 +227,28 @@ func (lb *LeakyBucket) Allow(key string) bool {
 <p>A linha do tempo é dividida em janelas fixas (por exemplo, por minuto), com um contador por janela. Passou do limite, rejeita até a próxima janela.</p>
 <div class="procon"><div class="pro"><h5>Prós</h5><ul><li>Simplíssimo (<code>INCR</code> + <code>EXPIRE</code>)</li><li>Pouca memória</li></ul></div><div class="con"><h5>Contras</h5><ul><li><strong>Pico na borda:</strong> com limite de 5/min, 5 requisições em 12:00:59 e mais 5 em 12:01:00 fazem 10 em 1 segundo</li></ul></div></div>
 
+<pre><code class="language-text">Limite: 3 requisições por minuto, janela fixa por minuto
+
+          12:00:00                       12:01:00                       12:02:00
+          |----------- janela 1 ----------|----------- janela 2 ----------|
+req:        ✓          ✓  ✓  ✗                 ✓ ✓ ✓  ✗
+contador:   1          2  3  (3, rejeita)      1 2 3  (rejeita)
+
+O problema da borda:
+                            12:00:40      12:01:00      12:01:20
+                               ✓ ✓ ✓    |    ✓ ✓ ✓
+                               \___________________/
+                               6 requisições em 40 s, com limite de 3/min</code></pre>
 <h3>4. Sliding window log</h3>
 <p>Guarda o timestamp de cada requisição (em Redis, um sorted set). A cada requisição, remove os timestamps mais antigos que a janela e conta os restantes.</p>
+<p>Exemplo com limite de 2 por minuto:</p>
+<div class="table-wrap"><table>
+<tr><th>Chega em</th><th>Log antes (após remover &gt; 60 s)</th><th>Tamanho</th><th>Decisão</th><th>Log depois</th></tr>
+<tr><td>1:00:01</td><td>[]</td><td>0</td><td>aceita</td><td>[1:00:01]</td></tr>
+<tr><td>1:00:30</td><td>[1:00:01]</td><td>1</td><td>aceita</td><td>[1:00:01, 1:00:30]</td></tr>
+<tr><td>1:00:50</td><td>[1:00:01, 1:00:30]</td><td>2</td><td>rejeita</td><td>(na versão clássica o timestamp também é gravado)</td></tr>
+<tr><td>1:01:40</td><td>[1:00:50] (1:00:01 e 1:00:30 expiraram)</td><td>1</td><td>aceita</td><td>[1:00:50, 1:01:40]</td></tr>
+</table></div>
 <div class="procon"><div class="pro"><h5>Prós</h5><ul><li><strong>Preciso</strong> em qualquer janela móvel</li></ul></div><div class="con"><h5>Contras</h5><ul><li>Muita memória: guarda timestamps até das requisições rejeitadas (na versão clássica) ou de todas as aceitas</li></ul></div></div>
 
 <h3>5. Sliding window counter</h3>
@@ -365,6 +424,36 @@ func (sc *SlidingWindowCounter) Allow(key string) bool {
 <tr><td>Sliding counter</td><td>O(1)</td><td>Suaviza</td><td>Aproximada</td><td>Alto volume com boa precisão</td></tr>
 </table></div>
 
+<h3>Token bucket passo a passo</h3>
+<p>Capacidade 3, reposição de 1 token/s. O balde começa cheio.</p>
+<div class="table-wrap"><table>
+<tr><th>Instante</th><th>Evento</th><th>Tokens antes (após repor)</th><th>Decisão</th><th>Tokens depois</th></tr>
+<tr><td>0,0 s</td><td>requisição</td><td>3</td><td>aceita</td><td>2</td></tr>
+<tr><td>0,1 s</td><td>requisição</td><td>2 + 0,1 = 2,1</td><td>aceita</td><td>1,1</td></tr>
+<tr><td>0,2 s</td><td>requisição</td><td>1,2</td><td>aceita</td><td>0,2</td></tr>
+<tr><td>0,3 s</td><td>requisição</td><td>0,3</td><td><strong>429</strong></td><td>0,3</td></tr>
+<tr><td>1,0 s</td><td>requisição</td><td>0,3 + 0,7 = 1,0</td><td>aceita</td><td>0</td></tr>
+<tr><td>5,0 s</td><td>requisição</td><td>min(3, 0 + 4) = 3</td><td>aceita</td><td>2</td></tr>
+</table></div>
+<p>Repare: a rajada de 3 passou de uma vez (a capacidade), a quarta foi barrada, e depois o cliente fica limitado à taxa de 1/s. Ficar parado recarrega o balde, mas nunca acima da capacidade. Nenhum timer é necessário: os tokens são calculados "preguiçosamente" a partir do tempo desde a última visita, e é por isso que o estado por chave é só dois números (tokens e timestamp).</p>
+
+<h3>Como escolher os parâmetros</h3>
+<ul>
+  <li><strong>Taxa (r):</strong> o uso sustentado que você aceita. Se um plano permite 6.000 requisições por minuto, r = 100/s.</li>
+  <li><strong>Capacidade (C):</strong> o tamanho da maior rajada legítima. Um app que abre a tela inicial e dispara 20 chamadas em paralelo precisa de C ≥ 20, mesmo que a taxa média seja de 1/s.</li>
+  <li><strong>Limites em camadas:</strong> é comum combinar um limite curto (10/s, contra rajadas abusivas) com um longo (10 mil/dia, para cota de plano). Cada um é um balde ou contador separado; a requisição só passa se passar em todos.</li>
+  <li>Comece permissivo, observe a distribuição real de uso (p99 por cliente) e aperte. Um limite apertado demais gera 429 para clientes legítimos, e isso vira chamado de suporte.</li>
+</ul>
+
+<h3>Qual é a chave?</h3>
+<div class="table-wrap"><table>
+<tr><th>Chave</th><th>Bom para</th><th>Cuidado</th></tr>
+<tr><td>IP</td><td>Tráfego não autenticado (login, cadastro), defesa contra bots</td><td>Muitos usuários atrás do mesmo IP (rede corporativa, operadora móvel com CGNAT) são limitados juntos. Com IPv6, um atacante tem milhões de endereços: limite por prefixo (/64) em vez do endereço completo.</td></tr>
+<tr><td>Usuário / API key</td><td>Tráfego autenticado; planos e cotas</td><td>Não protege o endpoint de login, que acontece antes da autenticação</td></tr>
+<tr><td>Endpoint + usuário</td><td>Endpoints caros com limites próprios</td><td>Mais chaves no Redis</td></tr>
+<tr><td>Global</td><td>Proteger um recurso compartilhado (API paga de terceiros)</td><td>Uma única chave quente</td></tr>
+</table></div>
+
 <h2 id="alto-nivel">Arquitetura de alto nível</h2>
 <p>Onde guardar os contadores? Banco é lento demais (disco). Use <strong>Redis</strong>: em memória, com <code>INCR</code> atômico e <code>EXPIRE</code>.</p>
 <figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
@@ -429,6 +518,18 @@ func Middleware(l Limiter, next http.Handler) http.Handler {
 <h2 id="distribuido">Deep dive: rate limiter distribuído</h2>
 <h3>Race condition</h3>
 <p>"Ler contador → checar → escrever contador+1" em duas requisições concorrentes: as duas leem 3, as duas escrevem 4, e uma requisição escapa do limite.</p>
+<figure class="mermaid-wrap"><pre class="mermaid">sequenceDiagram
+  participant A as Requisição 1
+  participant R as Redis (contador = 3, limite = 4)
+  participant B as Requisição 2
+  A->>R: GET contador
+  R-->>A: 3
+  B->>R: GET contador
+  R-->>B: 3
+  Note over A,B: as duas concluem que 3 + 1 ≤ 4
+  A->>R: SET contador 4
+  B->>R: SET contador 4
+  Note over R: contador = 4, mas 5 requisições passaram</pre></figure>
 <ul>
 <li><strong>Locks</strong> resolvem, mas são lentos.</li>
 <li><strong>Lua script no Redis</strong> torna a operação atômica (o Redis executa scripts de forma serial):</li>
@@ -446,7 +547,30 @@ redis.call('PEXPIRE', KEYS[1], math.ceil(cap / rate * 1000))
 return allowed</code></pre>
 <p>Para sliding log: <code>MULTI</code> com <code>ZREMRANGEBYSCORE</code> + <code>ZADD</code> + <code>ZCARD</code> + <code>EXPIRE</code>.</p>
 
-<h3>Sincronização entre vários rate limiters</h3>
+<h3>Fixed window no Redis, e a armadilha do EXPIRE</h3>
+<p>A versão ingênua é:</p>
+<pre><code class="language-text">count = INCR rl:{user}:{minuto_atual}
+if count == 1: EXPIRE rl:{user}:{minuto_atual} 60
+if count > limite: rejeita</code></pre>
+<p>O <code>INCR</code> é atômico, então não há corrida na contagem. Mas, se o processo morrer entre o <code>INCR</code> e o <code>EXPIRE</code>, a chave fica sem TTL e vaza memória para sempre. Duas correções: colocar as duas operações num script Lua (ou num <code>MULTI</code>), ou incluir o minuto no nome da chave (como acima) e definir o TTL sempre, não só quando <code>count == 1</code>. Repare também que, com o minuto no nome, não é preciso "zerar" o contador: cada minuto tem a sua chave.</p>
+
+<h3>Sliding window counter no Redis</h3>
+<p>Duas chaves por cliente: a do minuto atual e a do anterior. A cada requisição, um script lê as duas, calcula <code>atual + anterior × (1 − fração decorrida)</code>, e só incrementa a atual se a estimativa couber no limite. Custo: 2 contadores por cliente, o mesmo que o fixed window, com precisão muito melhor.</p>
+
+<h3>Quanta memória?</h3>
+<p>Com 10 milhões de clientes ativos e token bucket (um hash com 2 campos), cada chave ocupa ~100 bytes no Redis contando overhead: ~1 GB. Cabe num único nó, mas use um cluster pequeno pela vazão e pela disponibilidade. O sliding log, com limite de 1.000/hora, guardaria até 1.000 timestamps por cliente: ~10 milhões × 1.000 × ~20 bytes = 200 GB. Esse é o motivo prático para preferir o sliding counter em alto volume.</p>
+
+<h3>Sincronização entre vários rate limiters</h3><figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  subgraph Ruim["Estado local: cada limitador conta sozinho"]
+    C1[Cliente 1] --> L1[Limitador A: conta local]
+    C1 -. "próxima requisição" .-> L2[Limitador B: não sabe da anterior]
+  end
+  subgraph Bom["Estado centralizado"]
+    C2[Cliente 1] --> L3[Limitador A] --> R[(Redis)]
+    C2 -.-> L4[Limitador B] --> R
+  end</pre>
+<figcaption>Com várias instâncias atrás de um load balancer, o mesmo cliente cai em instâncias diferentes; os contadores precisam estar num lugar compartilhado.</figcaption></figure>
+
 <p>Com vários nós de middleware, o estado <em>não</em> pode ficar em memória local (o cliente 1 vai ao nó A, o cliente 2 ao nó B…). Sticky sessions não escalam. Solução: <strong>store centralizado (Redis)</strong>. Para reduzir a latência, um meio-termo é manter contadores locais e sincronizar com o Redis em lotes, aceitando uma pequena imprecisão.</p>
 
 <h3>Otimizações e escala</h3>
@@ -459,6 +583,13 @@ return allowed</code></pre>
 
 <h3>Outras camadas</h3>
 <p>Rate limiting pode ser aplicado também na camada de rede (L3, com iptables por IP) ou de transporte. No cliente: cache, evitar chamadas em loop, retry com backoff exponencial e respeito ao <code>Retry-After</code>.</p>
+
+<h3>Backoff exponencial com jitter (o lado do cliente)</h3>
+<p>Quando recebe 429 ou 503, o cliente deve esperar antes de tentar de novo, e cada nova falha dobra a espera: 1 s, 2 s, 4 s, 8 s… até um teto. O detalhe que mais se esquece é o <strong>jitter</strong>: se mil clientes foram limitados no mesmo segundo e todos esperam exatamente 2 s, todos voltam juntos no mesmo instante e são limitados de novo. Sortear a espera (por exemplo, um valor aleatório entre 0 e o limite atual, o "full jitter") espalha os retries e resolve o problema.</p>
+<pre><code class="language-text">espera = random(0, min(teto, base × 2^tentativa))</code></pre>
+
+<h3>Regras: qual vale quando várias combinam?</h3>
+<p>Uma requisição de um usuário do plano free em <code>POST /messages</code> pode bater em várias regras: limite global do plano, limite do endpoint, limite por IP. A forma usual é avaliar <strong>todas</strong> as que combinam e rejeitar se qualquer uma estourar. Cuidado com a ordem dos incrementos: se a regra A aceita e incrementa, mas a regra B rejeita, a requisição rejeitada consumiu cota de A. Um único script Lua que verifica todas as regras antes de incrementar qualquer uma evita isso.</p>
 
 <h2 id="simulacao">Simulação de entrevista</h2>
 <div class="dialog">
@@ -500,8 +631,8 @@ return allowed</code></pre>
 <li class="read"><a href="https://blog.cloudflare.com/counting-things-a-lot-of-different-things/" target="_blank" rel="noopener">Cloudflare: How we built rate limiting capable of scaling to millions of domains</a></li>
 <li class="read"><a href="https://pkg.go.dev/golang.org/x/time/rate" target="_blank" rel="noopener">Go: golang.org/x/time/rate</a><small>O token bucket "oficial" do ecossistema Go.</small></li>
 <li class="read"><a href="https://github.com/envoyproxy/ratelimit" target="_blank" rel="noopener">Envoy ratelimit</a><small>Serviço de rate limit em Go com Redis; é de onde vem o formato de regras em YAML.</small></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=bytebytego+rate+limiter+system+design" target="_blank" rel="noopener">ByteByteGo: Rate limiter</a></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=hello+interview+rate+limiter" target="_blank" rel="noopener">Hello Interview: Rate limiter mock</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=FU4WlwfS3G0" target="_blank" rel="noopener">System Design Interview: Rate limiting (local e distribuído)</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=MIJFyUPG4Z4" target="_blank" rel="noopener">Hello Interview: Design a distributed rate limiter</a></li>
 </ul>
 
 </article>

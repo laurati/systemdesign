@@ -22,6 +22,18 @@
 <li>Implementar base62 e o serviço em Go.</li>
 </ul></div>
 
+<h2 id="conceitos">Conceitos deste capítulo</h2>
+<div class="table-wrap"><table>
+<tr><th>Conceito</th><th>Definição</th></tr>
+<tr><td>URL curta / código curto</td><td>Identificador pequeno (por exemplo, <code>zn9edcu</code>) que o serviço associa a uma URL longa.</td></tr>
+<tr><td>Redirecionamento HTTP</td><td>Resposta 3xx com o header <code>Location</code>, que faz o navegador ir para outro endereço.</td></tr>
+<tr><td>301 / 302</td><td>Redirecionamento permanente (o navegador guarda e não pergunta de novo) / temporário (o navegador pergunta toda vez).</td></tr>
+<tr><td>Função de hash e colisão</td><td>Hash transforma a URL num valor de tamanho fixo; colisão é quando URLs diferentes produzem o mesmo valor (ou o mesmo prefixo).</td></tr>
+<tr><td>Base62</td><td>Representar um número usando 62 símbolos (0–9, a–z, A–Z), como o binário usa 2 e o decimal 10.</td></tr>
+<tr><td>Paradoxo do aniversário</td><td>Em um espaço de M valores, colisões ficam prováveis bem antes de M itens, com cerca de √M itens.</td></tr>
+<tr><td>Enumeração</td><td>Descobrir recursos percorrendo identificadores previsíveis (1, 2, 3…).</td></tr>
+</table></div>
+
 <h2 id="requisitos">Requisitos</h2>
 <div class="dialog">
 <p class="c">Pode dar um exemplo?</p><p class="i"><code>https://www.systeminterview.com/q=chatsystem&amp;c=loggedin&amp;v=v3&amp;l=long</code> vira <code>https://tinyurl.com/y7keocwj</code>, e clicar no curto redireciona para o longo.</p>
@@ -40,6 +52,13 @@
 <li>URL média de 100 bytes, então 365 bi × 100 B ≈ <strong>36,5 TB</strong>.</li>
 </ul>
 <p><strong>Tamanho do código:</strong> com 62 caracteres, precisamos de 62<sup>n</sup> ≥ 365 bilhões. 62<sup>6</sup> ≈ 56,8 bilhões (pouco); 62<sup>7</sup> ≈ <strong>3,5 trilhões</strong>. Então <strong>n = 7</strong>.</p>
+<h3>O que os números implicam</h3>
+<ul>
+  <li><strong>Escrita é baixa</strong> (~1.200/s, pico ~3 mil): qualquer banco aguenta; não há desafio de escrita.</li>
+  <li><strong>Leitura é o desafio</strong>, e ela é extremamente concentrada: uma URL compartilhada num post viral recebe milhões de cliques em uma hora, enquanto a maioria das URLs nunca é clicada de novo. Isso pede cache.</li>
+  <li><strong>36,5 TB</strong> não cabem confortavelmente num único servidor relacional e continuam crescendo; o acesso é sempre por chave exata (o código). Isso aponta para um banco chave-valor particionado.</li>
+  <li><strong>Cache:</strong> são ~1 bilhão de redirecionamentos por dia. Se 20% das URLs ativas geram 80% dos cliques, cachear as 100 milhões de URLs mais acessadas a ~200 bytes cada (código + URL + overhead) custa ~20 GB: cabe num cluster pequeno de Redis.</li>
+</ul>
 
 <h2 id="api">API</h2>
 <pre><code class="language-http">POST /api/v1/data/shorten
@@ -47,6 +66,16 @@
 
 GET  /api/v1/{shortCode}                   → 301/302  Location: https://...longUrl</code></pre>
 
+<figure class="mermaid-wrap"><pre class="mermaid">sequenceDiagram
+  participant B as Navegador
+  participant S as Encurtador
+  participant D as Site de destino
+  B->>S: GET sho.rt/zn9edcu
+  S-->>B: 301 (ou 302) Location: https://destino.com/pagina
+  B->>D: GET https://destino.com/pagina
+  D-->>B: 200 página
+  Note over B,S: com 301 o navegador guarda a resposta: o próximo clique vai direto ao destino
+  Note over B,S: com 302 todo clique passa pelo encurtador (e pode ser contado)</pre></figure>
 <h2 id="redirect">301 × 302</h2>
 <div class="table-wrap"><table>
 <tr><th></th><th>301 Moved Permanently</th><th>302 Found (temporário)</th></tr>
@@ -55,6 +84,8 @@ GET  /api/v1/{shortCode}                   → 301/302  Location: https://...lon
 <tr><td>Analytics (cliques, origem, país)</td><td>Perde</td><td>Completo</td></tr>
 <tr><td>Escolha quando</td><td>Prioridade é reduzir carga</td><td>Analytics é parte do produto (bit.ly)</td></tr>
 </table></div>
+
+<p>Um detalhe que muitos esquecem: um 301 cacheado pelo navegador nunca mais consulta o servidor, então você <strong>não consegue mudar o destino nem desativar o link</strong> (por exemplo, se ele passar a apontar para malware) para quem já clicou. Para produtos que permitem editar ou expirar links, isso é mais um argumento a favor do 302, ou de um 301 com <code>Cache-Control: max-age</code> curto.</p>
 
 <h2 id="alto-nivel">Design de alto nível</h2>
 <figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
@@ -67,15 +98,53 @@ GET  /api/v1/{shortCode}                   → 301/302  Location: https://...lon
   WS -.->|"evento de clique (se 302)"| K[[Kafka]] -.-> AN[(Analytics: ClickHouse)]</pre></figure>
 <p>A tabela é simples: <code>(id PK, short_url UNIQUE, long_url, created_at)</code>, mais um índice em <code>long_url</code> (ou no hash dela) para devolver o mesmo código se a URL já existir.</p>
 
+<h3>O redirecionamento, passo a passo</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">sequenceDiagram
+  participant B as Navegador
+  participant S as Servidor de redirect
+  participant C as Redis
+  participant D as Banco
+  B->>S: GET /zn9edcu
+  S->>C: GET url:zn9edcu
+  alt hit
+    C-->>S: https://exemplo.com/...
+  else miss
+    S->>D: SELECT long_url WHERE short = 'zn9edcu'
+    D-->>S: https://exemplo.com/...
+    S->>C: SET url:zn9edcu (TTL longo)
+  end
+  S-->>B: 302 Location: https://exemplo.com/...
+  S--)S: publica evento de clique (assíncrono)
+  B->>B: segue para o destino</pre></figure>
+<p>Se o código não existe, a resposta é 404. Vale cachear também a <em>ausência</em> (por alguns minutos): sem isso, alguém que faça requisições com códigos aleatórios gera um miss de cache e uma consulta ao banco por requisição. Um Bloom filter com todos os códigos existentes é outra forma de barrar esses pedidos antes do banco.</p>
+
 <h2 id="hash">Deep dive: gerar o código curto</h2>
 <h3>Opção A: hash + resolução de colisão</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart TB
+  IN[URL longa] --> H["hash: 7 primeiros caracteres"]
+  H --> E{"código já existe no banco?"}
+  E -->|"não"| SAVE[(Grava código → URL longa)]
+  E -->|"sim: colisão"| ADD["URL longa + sufixo predefinido"]
+  ADD --> H</pre>
+<figcaption>Resolução de colisão: altera a entrada e tenta de novo até achar um código livre.</figcaption></figure>
 <p>Aplicar CRC32, MD5 ou SHA-1 à URL longa e pegar os 7 primeiros caracteres. Mas 7 caracteres de um hash colidem. Solução: se colidir, concatenar um sufixo predefinido à URL e refazer o hash até não colidir.</p>
+<p><strong>Quão frequentes são as colisões?</strong> O espaço de 7 caracteres tem ~3,5 trilhões de códigos. Quando o banco já tiver 365 bilhões, cada código novo tem 365 / 3.520 ≈ <strong>10% de chance</strong> de cair num código já usado. Não é um caso raro que dá para ignorar; é uma em cada dez escritas, e o sistema precisa tratá-lo de forma barata.</p>
 <ul>
 <li>Cada geração exige consultar o banco para ver se o código existe, o que é caro. Um <strong>Bloom filter</strong> acelera a checagem.</li>
+<li>A checagem e a gravação precisam ser atômicas: dois servidores podem gerar o mesmo código ao mesmo tempo. A forma segura é uma constraint <code>UNIQUE</code> (ou uma escrita condicional, "grava só se não existir", no DynamoDB) e, se ela falhar, tentar o próximo sufixo.</li>
 <li>Vantagem: a mesma URL gera o mesmo código naturalmente; não precisa de gerador de IDs.</li>
 </ul>
 <h3>Opção B: ID único + conversão base62</h3>
 <p>Gere um ID numérico único (<a href="07-unique-id.html">Snowflake</a>, contador distribuído ou faixas de IDs pré-alocadas) e converta para base62. Exemplo: 11157 = 2×62² + 55×62 + 59, que vira "2" "T" "X" = <code>2TX</code>.</p>
+<h4>A conversão, passo a passo</h4>
+<p>É a mesma conta de converter para binário, só que dividindo por 62. Com o alfabeto <code>0–9</code> (valores 0–9), <code>a–z</code> (10–35) e <code>A–Z</code> (36–61):</p>
+<pre><code class="language-text">11157 ÷ 62 = 179   resto 59  → 'X'
+  179 ÷ 62 =   2   resto 55  → 'T'
+    2 ÷ 62 =   0   resto  2  → '2'
+Lendo os restos de baixo para cima: "2TX"
+
+Volta:  2×62² + 55×62 + 59 = 7688 + 3410 + 59 = 11157</code></pre>
+<p>Com um Snowflake de 64 bits, o número é enorme (~10<sup>18</sup>) e vira um código de 11 caracteres. Para ter 7 caracteres, o ID precisa ficar abaixo de 62<sup>7</sup> ≈ 3,5 × 10<sup>12</sup>, ou seja, vir de um contador (com faixas pré-alocadas), não de um Snowflake. Esse é um trade-off que vale dizer em voz alta.</p>
 <div class="table-wrap"><table>
 <tr><th></th><th>Hash + colisão</th><th>ID + base62</th></tr>
 <tr><td>Tamanho do código</td><td>Fixo (7)</td><td>Variável, cresce com o ID</td></tr>
@@ -91,6 +160,13 @@ GET  /api/v1/{shortCode}                   → 301/302  Location: https://...lon
 <li>Ela já está no banco? Devolve o código existente.</li>
 <li>Senão, gera um ID único, converte para base62 e grava (id, short, long).</li>
 </ol>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart TB
+  IN[URL longa] --> Q{"já está no banco?"}
+  Q -->|"sim"| R1[Devolve o código existente]
+  Q -->|"não"| G[Gerador de IDs: novo ID]
+  G --> B62[Converte o ID para base62]
+  B62 --> SAVE[(Grava id, código, URL longa)]
+  SAVE --> R2[Devolve o código novo]</pre></figure>
 <div class="code-title">go/shortener/shortener.go</div>
 <pre><code class="language-go" data-src="go/shortener/shortener.go">// Package shortener implementa um encurtador de URL usando
 // "ID único + conversão base62" — a abordagem sem colisões.
@@ -187,6 +263,24 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, long, http.StatusFound)
 }</code></pre>
 
+<h3>Embaralhando o ID sem perder a unicidade</h3>
+<p>Com um contador, os códigos saem em sequência (<code>2TX</code>, <code>2TY</code>, <code>2TZ</code>…) e qualquer um pode percorrer todos os links. A solução é aplicar ao número uma <strong>permutação</strong>: uma função que leva cada número de 0 a 62<sup>7</sup>−1 a outro número do mesmo intervalo, sem repetir. Como é uma permutação, dois IDs diferentes nunca viram o mesmo código, e por depender de uma chave secreta, números vizinhos viram códigos sem relação aparente.</p>
+<p>A construção clássica é uma <strong>rede de Feistel</strong>: divida o número em duas metades, e em cada rodada troque-as e misture uma delas com uma função de hash da outra e da chave. Feistel é sempre reversível, qualquer que seja a função usada. Uma alternativa mais simples (porém mais fácil de quebrar) é multiplicar por um número grande coprimo com o tamanho do espaço, módulo esse tamanho.</p>
+
+<h2 id="modelo">Modelo de dados e particionamento</h2>
+<pre><code class="language-sql">urls (
+  short_code  VARCHAR(7)  PRIMARY KEY,   -- chave de partição
+  long_url    TEXT        NOT NULL,
+  user_id     BIGINT,                    -- quem criou (opcional)
+  created_at  TIMESTAMP,
+  expires_at  TIMESTAMP NULL
+)</code></pre>
+<ul>
+  <li><strong>Particionar por <code>short_code</code>:</strong> o redirect, que é a operação crítica, sempre busca por ele, então cada leitura vai a uma única partição.</li>
+  <li><strong>"Essa URL longa já foi encurtada?"</strong> exige buscar pela URL longa, que não é a chave. Opções: uma segunda tabela <code>hash(long_url) → short_code</code>, ou simplesmente <em>não</em> deduplicar (cada pedido gera um código novo). O bit.ly, por exemplo, gera códigos diferentes por usuário para que cada um tenha suas próprias estatísticas. Pergunte ao entrevistador se a deduplicação é um requisito.</li>
+  <li><strong>Links por usuário</strong> ("meus links"): índice secundário por <code>user_id</code>, que é uma consulta rara e pode ser mais lenta.</li>
+</ul>
+
 <h2 id="redirecionamento">Deep dive: redirecionamento em escala</h2>
 <ul>
 <li><strong>Leitura muito maior que escrita:</strong> cache <code>short → long</code> no Redis. Com 20% das URLs gerando 80% do tráfego, um cache de algumas dezenas de GB dá um hit rate altíssimo.</li>
@@ -230,9 +324,9 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 <h2 id="recursos">Vídeos e leituras</h2>
 <ul class="links">
-<li class="video"><a href="https://www.youtube.com/results?search_query=hello+interview+design+bitly" target="_blank" rel="noopener">Hello Interview: Design Bit.ly</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=iUU4O1sWtJA" target="_blank" rel="noopener">Hello Interview: Design Bit.ly</a></li>
 <li class="read"><a href="https://www.hellointerview.com/learn/system-design/problem-breakdowns/bitly" target="_blank" rel="noopener">Hello Interview: breakdown escrito do Bit.ly</a></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=bytebytego+url+shortener" target="_blank" rel="noopener">ByteByteGo: URL shortener</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=Cg3XIqs_-4c" target="_blank" rel="noopener">TechPrep: Tiny URL — URL shortener</a></li>
 <li class="read"><a href="https://github.com/donnemartin/system-design-primer/blob/master/solutions/system_design/pastebin/README.md" target="_blank" rel="noopener">System Design Primer: Pastebin/Bit.ly</a></li>
 </ul>
 

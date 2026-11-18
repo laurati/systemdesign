@@ -22,6 +22,20 @@
 <li>Adicionar templates, preferências, rate limiting, retries e monitoramento.</li>
 </ul></div>
 
+<h2 id="conceitos">Conceitos deste capítulo</h2>
+<div class="table-wrap"><table>
+<tr><th>Conceito</th><th>Definição</th></tr>
+<tr><td>Provider</td><td>O seu serviço que monta e envia a notificação ao serviço de entrega.</td></tr>
+<tr><td>APNs / FCM</td><td>Serviços da Apple e do Google que entregam push a dispositivos iOS e Android.</td></tr>
+<tr><td>Device token</td><td>Identificador único do par app + aparelho, usado para endereçar um push.</td></tr>
+<tr><td>Payload</td><td>O conteúdo da notificação (título, corpo, dados extras), em JSON.</td></tr>
+<tr><td>Notificação transacional × marketing</td><td>Disparada por uma ação do usuário e esperada por ele (código 2FA, pedido enviado) × enviada em massa por iniciativa da empresa.</td></tr>
+<tr><td>At-least-once</td><td>Garantia de que cada mensagem é entregue pelo menos uma vez, podendo repetir.</td></tr>
+<tr><td>Idempotência / dedup</td><td>Processar a mesma mensagem duas vezes tem o mesmo efeito que uma; dedup é descartar repetições pelo ID.</td></tr>
+<tr><td>Dead-letter queue</td><td>Fila para onde vão as mensagens que falharam além do número máximo de tentativas.</td></tr>
+<tr><td>Opt-in / opt-out</td><td>Permissão do usuário para receber (ou não) notificações de um canal.</td></tr>
+</table></div>
+
 <h2 id="tipos">Tipos de notificação</h2>
 <div class="table-wrap"><table>
 <tr><th>Tipo</th><th>Fluxo</th><th>O que você precisa</th></tr>
@@ -30,6 +44,17 @@
 <tr><td>SMS</td><td>Provider → Twilio, Nexmo, AWS SNS → operadora</td><td>Telefone; custo por mensagem</td></tr>
 <tr><td>E-mail</td><td>Provider → SendGrid, Mailchimp, SES</td><td>Endereço; reputação do domínio (SPF/DKIM)</td></tr>
 </table></div>
+
+<h3>Como um push chega ao celular, por dentro</h3>
+<p>Seu servidor não fala diretamente com o celular. Quem mantém a conexão com o aparelho é o sistema operacional:</p>
+<ol>
+  <li><strong>Registro:</strong> ao abrir o app pela primeira vez (e após o usuário permitir notificações), o app pede ao sistema um <strong>device token</strong>. O iOS o obtém do APNs; o Android, do FCM. Esse token identifica a combinação app + aparelho.</li>
+  <li>O app envia o token ao <strong>seu</strong> backend, que o grava associado ao usuário.</li>
+  <li>O sistema operacional mantém <strong>uma única conexão persistente</strong> e econômica com o APNs/FCM, compartilhada por todos os apps. Por isso o push não gasta bateria por app.</li>
+  <li><strong>Envio:</strong> seu servidor chama a API do APNs (HTTP/2, autenticado por um token JWT assinado com a chave da sua conta de desenvolvedor) ou do FCM, com o device token e um payload pequeno (até 4 KB no APNs).</li>
+  <li>O APNs/FCM entrega ao aparelho quando ele estiver conectado. Se estiver desligado, guarda a notificação mais recente por um tempo limitado e entrega depois.</li>
+</ol>
+<p>Consequências para o design: tokens <strong>mudam e expiram</strong> (o app foi reinstalado, o usuário trocou de aparelho), então o backend precisa atualizá-los a cada abertura do app e apagar os que o provedor rejeitar. E o "entregue" do APNs significa "aceito pelo APNs", não "visto pelo usuário": confirmação de leitura exige que o app reporte de volta.</p>
 
 <h2 id="requisitos">Requisitos</h2>
 <div class="dialog">
@@ -41,12 +66,39 @@
 <p class="c">Volume?</p><p class="i">10 milhões de push, 1 milhão de SMS e 5 milhões de e-mails por dia.</p>
 </div>
 
+<h2 id="estimativas">Estimativas</h2>
+<ul>
+  <li>Total: 16 milhões por dia ≈ <strong>~200/s em média</strong>. Parece pouco, e é: a média não é o problema.</li>
+  <li>O problema são os <strong>picos</strong>. Uma campanha para 50 milhões de usuários que precisa sair em 1 hora exige ~14 mil envios/s; um alerta de "o jogo começou" para 10 milhões que precisa sair em 1 minuto, ~170 mil/s.</li>
+  <li>Os provedores impõem limites: um provedor de SMS pode aceitar algumas centenas por segundo por conta; o de e-mail, alguns milhares. Ou seja, nosso sistema consegue gerar mensagens muito mais rápido do que os provedores conseguem receber.</li>
+  <li>Log de notificações: 16 M/dia × ~500 bytes = 8 GB/dia, ~3 TB/ano. Cabe num banco de escrita intensa com retenção limitada (por exemplo, 90 dias).</li>
+</ul>
+<p><strong>O que isso implica:</strong> o sistema precisa de <strong>filas</strong> para absorver picos que são ordens de grandeza acima da média, e de <strong>controle de vazão por provedor</strong> para não ser bloqueado por eles. A pergunta central do design não é "como enviar rápido", mas "como enviar de forma confiável numa velocidade que o provedor aceite, sem que o urgente fique atrás do volumoso".</p>
+
+<h3>O caminho de cada canal</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  P[Seu provider] -->|"device token + payload"| APNS[APNs] --> I[iPhone]
+  P -->|"registration token + payload"| FCM[FCM] --> A[Android]
+  P -->|"telefone + texto"| SMS["Twilio / Nexmo"] --> OP[Operadora] --> T[Celular]
+  P -->|"e-mail + HTML"| EM["SendGrid / SES"] --> CX[Caixa de entrada]</pre>
+<figcaption>Em nenhum canal o seu servidor fala diretamente com o aparelho: sempre há um serviço terceiro no meio.</figcaption></figure>
 <h2 id="contatos">Coletando informações de contato</h2>
 <p>Ao instalar o app ou se cadastrar, o servidor grava os device tokens, o telefone e o e-mail. Um usuário pode ter <strong>vários dispositivos</strong>.</p>
 <pre><code class="language-sql">CREATE TABLE users  (user_id bigint PRIMARY KEY, email text, country_code int, phone text, created_at timestamptz);
 CREATE TABLE devices(id bigint PRIMARY KEY, user_id bigint REFERENCES users, device_token text, platform text, last_logged_in timestamptz);
 CREATE TABLE notification_settings(user_id bigint, channel text, opt_in boolean, PRIMARY KEY (user_id, channel));</code></pre>
 
+<figure class="mermaid-wrap"><pre class="mermaid">sequenceDiagram
+  participant U as Usuário
+  participant App as App
+  participant LB as Load balancer
+  participant API as API servers
+  participant DB as Banco
+  U->>App: instala e abre o app / se cadastra
+  App->>LB: envia device token, e-mail, telefone
+  LB->>API: encaminha
+  API->>DB: grava contato (users, devices)</pre>
+<figcaption>Coleta de contatos: acontece na instalação, no cadastro e a cada abertura do app (o token pode mudar).</figcaption></figure>
 <h2 id="v1">Primeira versão (e seus problemas)</h2>
 <figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
   S1[Serviço 1] & S2[Serviço 2] & SN[Serviço N] --> NS[Servidor de notificação único]
@@ -166,6 +218,18 @@ func (w *Worker) Handle(ctx context.Context, m Message) error {
 	w.mu.Unlock()
 	return err
 }</code></pre>
+<h3>E do lado de quem pede a notificação?</h3>
+<p>O serviço de pedidos grava "pedido enviado" no banco dele e depois chama a API de notificações. Se ele cair entre as duas coisas, o pedido foi atualizado e a notificação nunca foi pedida. Se fizer na ordem inversa, pode notificar algo que não aconteceu. A solução padrão é o <strong>transactional outbox</strong>:</p>
+<ol>
+  <li>Na mesma transação que atualiza o pedido, o serviço insere uma linha numa tabela <code>outbox</code> ("notificar pedido A-998 enviado", com um ID único).</li>
+  <li>Um processo separado lê a outbox (por polling ou CDC, lendo o log do banco), publica na fila de notificações e marca a linha como publicada.</li>
+  <li>Se ele cair depois de publicar e antes de marcar, publica de novo; o ID único faz o sistema de notificações descartar a repetição.</li>
+</ol>
+<p>Assim, ou as duas coisas acontecem, ou nenhuma. Detalhes em <a href="distribuidos.html">Sistemas distribuídos</a>.</p>
+
+<h3>O store de dedup, dimensionado</h3>
+<p>Guardar para sempre todos os IDs já enviados não é necessário: duplicatas acontecem por retries, que ocorrem em minutos ou horas. Um <code>SET notif:{id} 1 NX EX 86400</code> no Redis (grava só se não existir, expira em 24 h) resolve. Com 16 milhões por dia e ~60 bytes por chave, são ~1 GB.</p>
+
 <h3>Mecanismo de retry</h3>
 <ul>
 <li>Falhas transitórias (timeout, 5xx, 429 do provedor): retry com <strong>backoff exponencial + jitter</strong>.</li>
@@ -173,6 +237,13 @@ func (w *Worker) Handle(ctx context.Context, m Message) error {
 <li>Após N tentativas: <strong>dead-letter queue</strong> e alerta.</li>
 </ul>
 
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  Q[[Fila do canal]] --> W[Worker]
+  W -->|"sucesso"| LOG[(Log: sent)]
+  W -->|"falha transitória"| Q
+  W -->|"N falhas"| DLQ[[Dead-letter queue]]
+  W -->|"falha permanente"| INV[Marca token / contato inválido]</pre>
+<figcaption>Retry: o worker devolve a mensagem à fila (com espera crescente) até o limite de tentativas.</figcaption></figure>
 <h2 id="componentes-extras">Componentes adicionais</h2>
 <ul>
 <li><strong>Templates:</strong> formatos pré-definidos com parâmetros; consistência, menos erros e permitem A/B test e localização.</li>
@@ -185,6 +256,24 @@ func (w *Worker) Handle(ctx context.Context, m Message) error {
 <li><strong>Tracking de eventos:</strong> aberto, clicado, entregue; vai para analytics.</li>
 <li><strong>Fallback de provedor:</strong> dois provedores de SMS; se um falha, o circuit breaker troca para o outro.</li>
 </ul>
+<h3>Controlando a vazão para cada provedor</h3>
+<p>Os workers de SMS não podem simplesmente consumir a fila o mais rápido possível: se o provedor aceita 500/s e mandamos 5.000/s, recebemos 429 em massa e talvez um bloqueio. Cada pool de workers usa um <strong>rate limiter compartilhado por provedor</strong> (token bucket no Redis, como no <a href="04-rate-limiter.html">capítulo 04</a>), e a fila acumula o excesso. Com isso, a fila deixa de ser só um buffer e vira o lugar onde "esperar a vez" acontece de forma ordenada.</p>
+
+<h3>Horário silencioso e agendamento</h3>
+<p>"Envie às 9h no fuso de cada usuário" significa que a campanha sai em 24 ondas. Implementação comum: uma tabela de notificações agendadas indexada por horário de envio, e um <em>scheduler</em> que a cada minuto busca as que venceram e as publica na fila. Para volumes grandes, agrupe por "balde" de horário (todas as de 09:00 UTC−3) em vez de linha por usuário. Notificações transacionais ignoram o horário silencioso; as de marketing esperam.</p>
+
+<h3>E-mail tem regras próprias</h3>
+<ul>
+  <li><strong>Autenticação do domínio</strong> (SPF, DKIM, DMARC): sem isso, os e-mails vão para spam.</li>
+  <li><strong>Bounces:</strong> endereço inexistente (hard bounce) entra numa lista de supressão e nunca mais recebe. Insistir derruba a reputação do domínio.</li>
+  <li><strong>Reclamações:</strong> quando o usuário marca como spam, o provedor avisa por webhook; trate como opt-out imediato.</li>
+  <li><strong>Link de descadastro</strong> obrigatório em marketing (e exigido por lei em vários países).</li>
+  <li>Separe domínios ou IPs de envio transacional e de marketing: se a campanha for marcada como spam, os e-mails de redefinição de senha continuam chegando.</li>
+</ul>
+
+<h3>Central de notificações dentro do app</h3>
+<p>Muitos produtos também têm um "sininho" com a lista de notificações, lidas e não lidas. É outro canal: uma tabela <code>(user_id, notification_id, created_at, read)</code> particionada por usuário, um contador de não lidas em cache, e, se o usuário estiver com o app aberto, um envio em tempo real pela conexão WebSocket existente.</p>
+
 <figure class="mermaid-wrap"><pre class="mermaid">stateDiagram-v2
   [*] --> start
   start --> pending: enfileirada
@@ -225,7 +314,7 @@ func (w *Worker) Handle(ctx context.Context, m Message) error {
 <li class="read"><a href="https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns" target="_blank" rel="noopener">Apple: Sending notification requests to APNs</a></li>
 <li class="read"><a href="https://firebase.google.com/docs/cloud-messaging" target="_blank" rel="noopener">Firebase Cloud Messaging</a></li>
 <li class="read"><a href="https://aws.amazon.com/builders-library/avoiding-insurmountable-queue-backlogs/" target="_blank" rel="noopener">AWS: Avoiding insurmountable queue backlogs</a></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=design+notification+system+system+design+interview" target="_blank" rel="noopener">Vídeos: Design a notification system</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=lQar05ZOq7g" target="_blank" rel="noopener">Mock interview: Notification service at scale (1 bi/dia)</a></li>
 </ul>
 
 </article>

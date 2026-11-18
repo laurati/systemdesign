@@ -22,6 +22,20 @@
 <li>Otimizar velocidade, segurança e custo de CDN.</li>
 </ul></div>
 
+<h2 id="conceitos">Conceitos deste capítulo</h2>
+<div class="table-wrap"><table>
+<tr><th>Conceito</th><th>Definição</th></tr>
+<tr><td>Transcodificação (encoding)</td><td>Converter o vídeo original para outros formatos, resoluções e bitrates.</td></tr>
+<tr><td>Codec / container</td><td>Algoritmo de compressão (H.264, VP9, AV1) / formato de arquivo que embala vídeo, áudio e metadados (MP4, WebM).</td></tr>
+<tr><td>Bitrate</td><td>Quantidade de bits por segundo de vídeo; mais bitrate, mais qualidade e mais banda.</td></tr>
+<tr><td>Streaming adaptativo (ABR)</td><td>O player troca de qualidade durante a reprodução conforme a banda disponível.</td></tr>
+<tr><td>HLS / MPEG-DASH</td><td>Protocolos de streaming sobre HTTP: um manifest lista segmentos curtos em várias qualidades.</td></tr>
+<tr><td>GOP</td><td><em>Group of pictures</em>: bloco de quadros que começa num quadro completo e pode ser decodificado sozinho.</td></tr>
+<tr><td>DAG</td><td>Grafo acíclico direcionado: tarefas com dependências, em que as independentes rodam em paralelo.</td></tr>
+<tr><td>URL pré-assinada</td><td>URL com assinatura e validade que autoriza uma única operação (enviar ou baixar um objeto) sem expor credenciais.</td></tr>
+<tr><td>DRM</td><td>Tecnologias que cifram o conteúdo e controlam quem pode reproduzi-lo (FairPlay, Widevine, PlayReady).</td></tr>
+</table></div>
+
 <h2 id="requisitos">Requisitos</h2>
 <div class="dialog">
 <p class="c">Funcionalidades mais importantes?</p><p class="i">Upload e assistir vídeos.</p>
@@ -41,7 +55,10 @@
 <li>5 M DAU, 5 vídeos assistidos por dia; <strong>10%</strong> dos usuários fazem upload de 1 vídeo por dia.</li>
 <li>Vídeo médio de 300 MB: 5 M × 10% × 300 MB = <strong>150 TB/dia</strong> de armazenamento novo.</li>
 <li>Custo de CDN (CloudFront, ~US$ 0,02/GB nos EUA): 5 M × 5 vídeos × 0,3 GB × US$ 0,02 = <strong>US$ 150 mil por dia</strong>. Esse número guia o deep dive de custo.</li>
+<li><strong>Uploads:</strong> 500 mil vídeos por dia ≈ 6 por segundo. Baixo em QPS, mas cada um é um arquivo grande e um trabalho pesado de processamento.</li>
+<li><strong>Transcodificação:</strong> se cada vídeo tem em média 5 minutos e é codificado em 5 qualidades, e se um núcleo de CPU codifica mais ou menos em tempo real, são 500 mil × 5 min × 5 = 12,5 milhões de minutos de CPU por dia ≈ <strong>~9 mil núcleos ocupados o tempo todo</strong>. É uma ordem de grandeza (codecs e presets mudam isso em 10×), mas mostra que o processamento é uma frota grande e elástica, não "um servidor".</li>
 </ul>
+<p><strong>O que isso implica:</strong> o sistema tem três partes com perfis muito diferentes. Metadados (título, dono, status) são pequenos e de pouco volume: um banco relacional comum. O processamento é intensivo em CPU e assíncrono: filas e uma frota de workers. A entrega é intensiva em banda: CDN. O deep dive vai para onde está o dinheiro: transcodificação e CDN.</p>
 
 <h2 id="alto-nivel">Alto nível</h2>
 <figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
@@ -60,6 +77,34 @@
 <li><strong>Metadados:</strong> enquanto o arquivo sobe, o cliente envia título, descrição, tags etc. aos API servers, que gravam no metadata DB e no cache.</li>
 </ol>
 
+<h3>Upload retomável, por dentro</h3>
+<p>Um arquivo de 1 GB enviado numa única requisição falha com frequência em rede móvel, e recomeçar do zero é péssimo. O padrão é o <strong>upload multipart</strong> (como no S3):</p>
+<ol>
+  <li>O cliente pede à API para iniciar um upload. A API cria o registro do vídeo com status <code>uploading</code>, inicia um multipart upload no storage e devolve um <code>upload_id</code> e URLs pré-assinadas para cada parte (por exemplo, partes de 10 MB).</li>
+  <li>O cliente envia as partes, várias em paralelo. Cada parte confirmada devolve uma etiqueta (ETag).</li>
+  <li>Se a conexão cair, o cliente pergunta quais partes já chegaram e envia só as que faltam.</li>
+  <li>Ao final, o cliente pede para "completar": o storage junta as partes num único objeto, e um evento ("objeto criado") dispara o pipeline de processamento.</li>
+</ol>
+
+<h3>Os estados de um vídeo</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">stateDiagram-v2
+  [*] --> uploading
+  uploading --> processing: upload completo
+  uploading --> abandoned: sem atividade por 24 h
+  processing --> ready: qualidades mínimas prontas
+  processing --> failed: erro não recuperável
+  ready --> ready: novas qualidades adicionadas
+  ready --> removed: denúncia ou exclusão</pre></figure>
+<p>Um detalhe que melhora muito a experiência: o vídeo não precisa esperar todas as qualidades. Assim que 360p e 720p estiverem prontas, ele pode ser publicado; 1080p e 4K entram depois, quando o manifest é atualizado.</p>
+
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  U[Usuário] -->|"1. upload (URL pré-assinada)"| OS[(Original storage)]
+  OS -->|"2. evento: arquivo novo"| TS[Transcoding servers]
+  TS -->|"3a. vídeos codificados"| TST[(Transcoded storage)] --> CDN[CDN]
+  TS -->|"3b. evento: pronto"| CQ[[Completion queue]] --> CH[Completion handler]
+  CH -->|"4. status = ready, URLs"| META[(Metadata DB + cache)]
+  U -->|"em paralelo: título, descrição"| API[API servers] --> META</pre>
+<figcaption>Upload: o arquivo e os metadados seguem caminhos separados e se encontram no banco de metadados.</figcaption></figure>
 <h2 id="streaming">Fluxo de streaming</h2>
 <p>O vídeo é <em>transmitido</em> em pedaços, não baixado inteiro antes. O player toca enquanto baixa os próximos segmentos, direto da CDN mais próxima.</p>
 <div class="table-wrap"><table>
@@ -69,6 +114,37 @@
 <tr><td>Microsoft Smooth Streaming, Adobe HDS</td><td>Legados</td></tr>
 </table></div>
 <p><strong>Adaptive bitrate (ABR):</strong> cada vídeo é codificado em várias resoluções/bitrates e dividido em segmentos de poucos segundos; um <em>manifest</em> lista as opções. O player mede a banda e troca de qualidade entre segmentos. É por isso que o vídeo fica "borrado" por um instante quando a rede piora, mas não para.</p>
+
+<h3>Como o HLS funciona, na prática</h3>
+<p>O player primeiro baixa uma <strong>master playlist</strong>, que lista as qualidades disponíveis:</p>
+<pre><code class="language-text">#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+360p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720
+720p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+1080p/index.m3u8</code></pre>
+<p>Escolhe uma qualidade e baixa a <strong>media playlist</strong> dela, que lista os segmentos:</p>
+<pre><code class="language-text">#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXTINF:6.0,
+seg_0001.ts
+#EXTINF:6.0,
+seg_0002.ts
+...
+#EXT-X-ENDLIST</code></pre>
+<p>Depois baixa os segmentos em sequência, mantendo um <strong>buffer</strong> de alguns segmentos à frente do que está tocando. A cada segmento, o player mede quanto tempo o download levou. Se 6 s de vídeo de 720p (~2 MB) chegaram em 1 s, há folga e ele pode subir para 1080p no próximo segmento; se levaram 5 s, o buffer está esvaziando e ele desce para 360p antes de travar. Como os segmentos de todas as qualidades começam nos mesmos instantes, a troca é imperceptível.</p>
+<p>Tudo isso são <strong>arquivos estáticos servidos por HTTP</strong>. Essa é a razão pela qual o streaming de vídeo escala tão bem: qualquer CDN cacheia os segmentos como se fossem imagens.</p>
+
+<h3>A "escada" de qualidades</h3>
+<div class="table-wrap"><table>
+<tr><th>Qualidade</th><th>Bitrate típico (H.264)</th><th>Por hora</th></tr>
+<tr><td>360p</td><td>~0,8 Mbps</td><td>~360 MB</td></tr>
+<tr><td>720p</td><td>~2,5–3 Mbps</td><td>~1,2 GB</td></tr>
+<tr><td>1080p</td><td>~5 Mbps</td><td>~2,2 GB</td></tr>
+<tr><td>4K</td><td>~15–20 Mbps</td><td>~8 GB</td></tr>
+</table></div>
+<p>Codecs mais novos (VP9, AV1) entregam a mesma qualidade com 30–50% menos bits, ao custo de codificação muito mais lenta. Vale a pena para vídeos muito assistidos (cada byte economizado se multiplica pelas visualizações) e não para a cauda longa.</p>
 
 <h2 id="transcoding">Deep dive: transcodificação</h2>
 <p><strong>Por quê?</strong> (1) o vídeo cru é enorme (1 hora de HD a 60 fps pode ter centenas de GB); (2) dispositivos e navegadores suportam formatos diferentes; (3) o ABR exige várias qualidades; (4) redes móveis precisam de bitrates baixos.</p>
@@ -98,8 +174,29 @@
 <tr><td>Temporary storage</td><td>Metadados em memória; vídeo e áudio em blob</td></tr>
 <tr><td>Encoded video</td><td>Saída final: por exemplo, <code>funny_720p.mp4</code></td></tr>
 </table></div>
+<h3>Por que dividir em GOPs acelera tanto</h3>
+<p>Codificar um vídeo de 60 minutos numa única máquina leva cerca de 60 minutos (ou mais) por qualidade. Dividido em 600 pedaços de 6 s, cada pedaço pode ser codificado por um worker diferente ao mesmo tempo, e o vídeo inteiro fica pronto em pouco mais que o tempo de um pedaço. A divisão precisa respeitar os GOPs: cada pedaço deve começar num <em>keyframe</em> (um quadro completo, que não depende dos anteriores), senão ele não pode ser decodificado sozinho. Depois, os pedaços codificados são concatenados ou simplesmente viram os próprios segmentos do HLS.</p>
+
 <p>Na prática você pode citar <strong>Temporal / Step Functions</strong> para orquestrar o DAG, ou filas + workers em Kubernetes, com instâncias spot para baratear.</p>
 
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  PRE[Preprocessor: divide em GOPs, gera o DAG] --> SCH[DAG scheduler: divide em estágios]
+  SCH --> RM
+  subgraph RM[Resource manager]
+    TQ[[Fila de tarefas: por prioridade]]
+    WQ[[Fila de workers: por utilização]]
+    TS{Task scheduler}
+    RQ[[Fila em execução]]
+    TQ --> TS
+    WQ --> TS
+    TS --> RQ
+  end
+  RQ --> W1[Worker: encoder]
+  RQ --> W2[Worker: thumbnail]
+  RQ --> W3[Worker: watermark]
+  W1 & W2 & W3 --> TMP[(Temporary storage)]
+  TMP --> OUT[(Vídeo codificado)]</pre>
+<figcaption>Arquitetura de transcodificação: o scheduler pega a tarefa de maior prioridade e o worker mais adequado e livre.</figcaption></figure>
 <h2 id="otimizacoes">Otimizações</h2>
 <h3>Velocidade</h3>
 <ul>
@@ -121,12 +218,46 @@
 <li>Construir a própria CDN e fazer acordos com ISPs (o Netflix Open Connect põe caches dentro dos provedores).</li>
 </ol>
 
+<h3>Paralelismo com filas entre os estágios</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  OS[(Original storage)] --> Q1[[fila]] --> DL[Download]
+  DL --> Q2[[fila]] --> ENC[Encoding]
+  ENC --> Q3[[fila]] --> UP[Upload]
+  UP --> CDN[CDN]</pre>
+<figcaption>Sem filas, cada estágio espera o anterior terminar; com filas, todos trabalham ao mesmo tempo em vídeos diferentes.</figcaption></figure>
+<h3>URL pré-assinada</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">sequenceDiagram
+  participant C as Cliente
+  participant API as API servers
+  participant S as Object storage
+  C->>API: quero enviar um vídeo
+  API-->>C: URL pré-assinada (vale 15 min, só PUT neste caminho)
+  C->>S: PUT do arquivo na URL
+  S-->>C: 200</pre></figure>
+<h3>Servindo a cauda longa</h3>
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  U[Usuários] -->|"vídeos populares"| CDN[CDN]
+  U -->|"vídeos pouco vistos"| VS[Servidores de vídeo próprios]
+  CDN --> ST[(Storage)]
+  VS --> ST</pre></figure>
 <h2 id="dados">Metadados e escala</h2>
 <ul>
 <li><strong>Metadados de vídeo</strong> (id, título, dono, status, URLs): relacional (o YouTube usa MySQL sharded com <strong>Vitess</strong>), réplicas de leitura e cache.</li>
 <li><strong>Contadores de views:</strong> alta escrita, então agregue em memória/stream e grave em lote; números aproximados são aceitáveis.</li>
 <li><strong>Comentários, likes:</strong> wide-column ou relacional sharded por video_id.</li>
 </ul>
+
+<h3>Contando visualizações</h3>
+<p>Um vídeo viral recebe dezenas de milhares de visualizações por segundo. Fazer <code>UPDATE videos SET views = views + 1</code> para cada uma cria contenção numa única linha. O padrão:</p>
+<ol>
+  <li>O player envia um evento "visualização" (só depois de alguns segundos assistidos, para não contar quem fechou na hora).</li>
+  <li>Os eventos vão para um stream (Kafka), particionado por video_id.</li>
+  <li>Um processador agrega por janela (por exemplo, a cada 10 s soma as visualizações de cada vídeo), filtra fraude (o mesmo usuário recarregando em loop) e grava um único incremento por vídeo por janela.</li>
+</ol>
+<p>A contagem exibida fica alguns segundos atrasada, o que ninguém percebe, e a escrita no banco cai de milhares por segundo para uma a cada 10 segundos por vídeo.</p>
+
+<h3>E ao vivo?</h3>
+<p>Uma live usa as mesmas peças com latência apertada: o streamer envia por RTMP/SRT, servidores de ingestão transcodificam <em>em tempo real</em> para a escada de qualidades, e o HLS/DASH é gerado continuamente, com a media playlist sendo atualizada a cada novo segmento (sem <code>#EXT-X-ENDLIST</code>). Segmentos menores (1–2 s, ou o LL-HLS com "partes" ainda menores) reduzem o atraso de ~30 s para poucos segundos. A diferença principal: não há como pré-processar, e uma falha no transcodificador é visível na hora.</p>
 
 <h2 id="falhas">Tratamento de erros</h2>
 <div class="table-wrap"><table>
@@ -170,7 +301,7 @@
 <li class="read"><a href="https://engineering.fb.com/2015/03/02/video-engineering/sve-distributed-video-processing-at-facebook-scale/" target="_blank" rel="noopener">SVE: Distributed video processing at Facebook scale</a></li>
 <li class="read"><a href="https://vitess.io/" target="_blank" rel="noopener">Vitess</a><small>Sharding de MySQL criado no YouTube.</small></li>
 <li class="read"><a href="https://www.hellointerview.com/learn/system-design/problem-breakdowns/youtube" target="_blank" rel="noopener">Hello Interview: YouTube</a></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=design+youtube+system+design+interview" target="_blank" rel="noopener">Vídeos: Design YouTube / Netflix</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=IUrQ5_g3XKs" target="_blank" rel="noopener">Hello Interview: Design YouTube</a></li>
 </ul>
 
 </article>

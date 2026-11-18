@@ -22,6 +22,19 @@
 <li>Implementar o anel em Go e medir quantas chaves se movem.</li>
 </ul></div>
 
+<h2 id="conceitos">Conceitos deste capítulo</h2>
+<div class="table-wrap"><table>
+<tr><th>Conceito</th><th>Definição</th></tr>
+<tr><td>Função de hash</td><td>Função que transforma qualquer entrada num número de tamanho fixo, de forma determinística e bem espalhada.</td></tr>
+<tr><td>Espaço de hash</td><td>O intervalo de valores possíveis da função (por exemplo, 0 a 2<sup>32</sup> − 1).</td></tr>
+<tr><td>Rehashing</td><td>Recalcular onde cada chave mora quando o número de servidores muda. Com <code>hash % N</code>, quase todas as chaves mudam.</td></tr>
+<tr><td>Anel de hash</td><td>O espaço de hash com as pontas unidas; servidores e chaves são posicionados nele.</td></tr>
+<tr><td>Consistent hashing</td><td>Esquema em que adicionar ou remover um servidor move, em média, só K/N das chaves (K chaves, N servidores).</td></tr>
+<tr><td>Partição</td><td>Trecho do anel entre dois servidores consecutivos; todas as chaves nele pertencem ao mesmo servidor.</td></tr>
+<tr><td>Nó virtual (vnode)</td><td>Cada uma das várias posições que um mesmo servidor físico ocupa no anel.</td></tr>
+<tr><td>Hotspot / hot key</td><td>Servidor ou chave que recebe muito mais tráfego que os demais.</td></tr>
+</table></div>
+
 <h2 id="problema">O problema do rehash</h2>
 <p>Com N servidores de cache, a forma ingênua é <code>servidor = hash(chave) % N</code>. Funciona bem enquanto N é fixo. Mas se um servidor cai (N=4 → 3) ou entra um novo (4 → 5), <strong>quase todas as chaves mudam de servidor</strong>: uma tempestade de cache misses que derruba o banco.</p>
 <div class="table-wrap"><table>
@@ -34,6 +47,11 @@
 <tr><td>key5</td><td>27581703</td><td>3</td><td>0</td></tr>
 </table></div>
 <p>Nos testes Go deste site, ir de 4 para 5 servidores com módulo moveu <strong>~80%</strong> das chaves. Com consistent hashing, <strong>~19%</strong> (próximo do ideal de 1/5).</p>
+<h3>Por que exatamente ~80%?</h3>
+<p>Uma chave só fica no mesmo servidor se <code>h % 4 == h % 5</code>. Os restos se repetem a cada 20 números (o mínimo múltiplo comum de 4 e 5), e entre 0 e 19 isso só acontece para h = 0, 1, 2, 3: 4 de 20 valores, ou seja, 20% das chaves ficam e <strong>80% se movem</strong>. Em geral, indo de N para N+1 servidores, só 1/(N+1) das chaves fica no lugar. Quanto maior o cluster, pior: de 100 para 101 servidores, 99% das chaves mudam de servidor.</p>
+<p>O ideal é o contrário: ao adicionar o servidor N+1, só as chaves que <em>vão para ele</em> deveriam se mover, ou seja, 1/(N+1) delas. É esse mínimo que o consistent hashing alcança.</p>
+<div class="box info"><strong class="t">Por que isso importa tanto</strong>
+Num <strong>cache</strong>, chave que muda de servidor vira cache miss: 80% de miss de uma vez manda 80% das leituras para o banco, que normalmente está dimensionado para receber 5–10%. Num <strong>banco particionado</strong>, chave que muda de servidor é dado que precisa ser <em>copiado pela rede</em>: mover 80% de 50 TB são 40 TB transferidos, contra 10 TB no caso ideal.</div>
 
 <h2 id="anel">O anel de hash</h2>
 <ol>
@@ -48,19 +66,43 @@
     S0((s0)) --> K1[k1] --> S1((s1)) --> K2[k2] --> S2((s2)) --> K3[k3] --> S3((s3)) --> K0[k0] --> S0
   end</pre>
 <figcaption>k0 → s0, k1 → s1, k2 → s2, k3 → s3. Cada chave vai para o próximo servidor no sentido horário.</figcaption></figure>
+<h3>Do espaço de hash ao anel</h3>
+<p>Uma função de hash como SHA-1 devolve um número entre 0 e 2<sup>160</sup> − 1. Imagine esses números numa reta: o 0 numa ponta e o maior valor na outra. O anel é só essa reta com as duas pontas coladas, de modo que depois do maior valor vem o 0 de novo. Isso permite dizer sempre "o próximo servidor depois desta posição", mesmo para uma chave perto do fim.</p>
+<pre><code class="language-text">reta:  0 ──────────────────────────────────────────── 2^160 − 1
+anel:  cole as pontas: ... 2^160 − 2, 2^160 − 1, 0, 1, 2 ...</code></pre>
+<figure class="ring-wrap" style="display:flex;flex-wrap:wrap;gap:12px;justify-content:center;margin:18px 0"><div style="text-align:center"><svg viewBox="0 0 300 300" width="300" height="300" role="img" aria-label="anel com 4 servidores" style="max-width:100%"><circle cx="150.0" cy="150.0" r="108.0" fill="none" stroke="currentColor" stroke-opacity=".35" stroke-width="2"/><text x="150.0" y="146.0" text-anchor="middle" font-size="12" fill="currentColor" opacity=".7">sentido</text><text x="150.0" y="162.0" text-anchor="middle" font-size="12" fill="currentColor" opacity=".7">horário ↻</text><circle cx="116.6" cy="47.3" r="5" fill="var(--bg,#fff)" stroke="#2563eb" stroke-width="2.5"/><text x="124.0" y="74.1" text-anchor="middle" font-size="11" fill="#2563eb">k0</text><circle cx="252.7" cy="116.6" r="5" fill="var(--bg,#fff)" stroke="#16a34a" stroke-width="2.5"/><text x="229.9" y="128.0" text-anchor="middle" font-size="11" fill="#16a34a">k1</text><circle cx="183.4" cy="252.7" r="5" fill="var(--bg,#fff)" stroke="#d97706" stroke-width="2.5"/><text x="176.0" y="233.9" text-anchor="middle" font-size="11" fill="#d97706">k2</text><circle cx="47.3" cy="183.4" r="5" fill="var(--bg,#fff)" stroke="#9333ea" stroke-width="2.5"/><text x="70.1" y="180.0" text-anchor="middle" font-size="11" fill="#9333ea">k3</text><rect x="176.4" y="40.3" width="14" height="14" rx="3" fill="#2563eb"/><text x="189.6" y="32.3" text-anchor="middle" font-size="12" font-weight="700" fill="#2563eb">s0</text><rect x="245.7" y="176.4" width="14" height="14" rx="3" fill="#16a34a"/><text x="271.7" y="193.6" text-anchor="middle" font-size="12" font-weight="700" fill="#16a34a">s1</text><rect x="109.6" y="245.7" width="14" height="14" rx="3" fill="#d97706"/><text x="110.4" y="275.7" text-anchor="middle" font-size="12" font-weight="700" fill="#d97706">s2</text><rect x="40.3" y="109.6" width="14" height="14" rx="3" fill="#9333ea"/><text x="28.3" y="114.4" text-anchor="middle" font-size="12" font-weight="700" fill="#9333ea">s3</text></svg><div style="font-size:13px;color:var(--muted)">4 servidores, 4 chaves</div></div><div style="text-align:center"><svg viewBox="0 0 300 300" width="300" height="300" role="img" aria-label="adicionando s4" style="max-width:100%"><circle cx="150.0" cy="150.0" r="108.0" fill="none" stroke="currentColor" stroke-opacity=".35" stroke-width="2"/><text x="150.0" y="146.0" text-anchor="middle" font-size="12" fill="currentColor" opacity=".7">sentido</text><text x="150.0" y="162.0" text-anchor="middle" font-size="12" fill="currentColor" opacity=".7">horário ↻</text><circle cx="116.6" cy="47.3" r="5" fill="var(--bg,#fff)" stroke="#dc2626" stroke-width="2.5"/><text x="124.0" y="74.1" text-anchor="middle" font-size="11" fill="#dc2626">k0</text><circle cx="252.7" cy="116.6" r="5" fill="var(--bg,#fff)" stroke="#16a34a" stroke-width="2.5"/><text x="229.9" y="128.0" text-anchor="middle" font-size="11" fill="#16a34a">k1</text><circle cx="183.4" cy="252.7" r="5" fill="var(--bg,#fff)" stroke="#d97706" stroke-width="2.5"/><text x="176.0" y="233.9" text-anchor="middle" font-size="11" fill="#d97706">k2</text><circle cx="47.3" cy="183.4" r="5" fill="var(--bg,#fff)" stroke="#9333ea" stroke-width="2.5"/><text x="70.1" y="180.0" text-anchor="middle" font-size="11" fill="#9333ea">k3</text><rect x="176.4" y="40.3" width="14" height="14" rx="3" fill="#2563eb"/><text x="189.6" y="32.3" text-anchor="middle" font-size="12" font-weight="700" fill="#2563eb">s0</text><rect x="245.7" y="176.4" width="14" height="14" rx="3" fill="#16a34a"/><text x="271.7" y="193.6" text-anchor="middle" font-size="12" font-weight="700" fill="#16a34a">s1</text><rect x="109.6" y="245.7" width="14" height="14" rx="3" fill="#d97706"/><text x="110.4" y="275.7" text-anchor="middle" font-size="12" font-weight="700" fill="#d97706">s2</text><rect x="40.3" y="109.6" width="14" height="14" rx="3" fill="#9333ea"/><text x="28.3" y="114.4" text-anchor="middle" font-size="12" font-weight="700" fill="#9333ea">s3</text><rect x="129.5" y="35.9" width="14" height="14" rx="3" fill="#dc2626"/><text x="134.0" y="27.0" text-anchor="middle" font-size="12" font-weight="700" fill="#dc2626">s4</text></svg><div style="font-size:13px;color:var(--muted)">entra s4: só k0 muda (s0 → s4)</div></div><div style="text-align:center"><svg viewBox="0 0 300 300" width="300" height="300" role="img" aria-label="removendo s1" style="max-width:100%"><circle cx="150.0" cy="150.0" r="108.0" fill="none" stroke="currentColor" stroke-opacity=".35" stroke-width="2"/><text x="150.0" y="146.0" text-anchor="middle" font-size="12" fill="currentColor" opacity=".7">sentido</text><text x="150.0" y="162.0" text-anchor="middle" font-size="12" fill="currentColor" opacity=".7">horário ↻</text><circle cx="116.6" cy="47.3" r="5" fill="var(--bg,#fff)" stroke="#2563eb" stroke-width="2.5"/><text x="124.0" y="74.1" text-anchor="middle" font-size="11" fill="#2563eb">k0</text><circle cx="252.7" cy="116.6" r="5" fill="var(--bg,#fff)" stroke="#d97706" stroke-width="2.5"/><text x="229.9" y="128.0" text-anchor="middle" font-size="11" fill="#d97706">k1</text><circle cx="183.4" cy="252.7" r="5" fill="var(--bg,#fff)" stroke="#d97706" stroke-width="2.5"/><text x="176.0" y="233.9" text-anchor="middle" font-size="11" fill="#d97706">k2</text><circle cx="47.3" cy="183.4" r="5" fill="var(--bg,#fff)" stroke="#9333ea" stroke-width="2.5"/><text x="70.1" y="180.0" text-anchor="middle" font-size="11" fill="#9333ea">k3</text><rect x="176.4" y="40.3" width="14" height="14" rx="3" fill="#2563eb"/><text x="189.6" y="32.3" text-anchor="middle" font-size="12" font-weight="700" fill="#2563eb">s0</text><rect x="109.6" y="245.7" width="14" height="14" rx="3" fill="#d97706"/><text x="110.4" y="275.7" text-anchor="middle" font-size="12" font-weight="700" fill="#d97706">s2</text><rect x="40.3" y="109.6" width="14" height="14" rx="3" fill="#9333ea"/><text x="28.3" y="114.4" text-anchor="middle" font-size="12" font-weight="700" fill="#9333ea">s3</text></svg><div style="font-size:13px;color:var(--muted)">sai s1: só k1 muda (s1 → s2)</div></div><figcaption style="flex-basis:100%;text-align:center">Quadrados são servidores; círculos são chaves, na cor do servidor dono. Cada chave pertence ao primeiro servidor no sentido horário.</figcaption></figure>
 <ul>
 <li><strong>Adicionar s4</strong> entre s3 e s0: só as chaves entre s3 e s4 (antes de s0) mudam, e vão para s4.</li>
 <li><strong>Remover s1:</strong> só as chaves entre s0 e s1 mudam, e vão para s2.</li>
 </ul>
+
+<h3>Exemplo com números pequenos</h3>
+<p>Para enxergar o mecanismo, imagine um anel de 0 a 99 (na prática é 0 a 2<sup>32</sup>−1, mas a lógica é a mesma).</p>
+<ul>
+  <li>Servidores: hash(A) = 10, hash(B) = 45, hash(C) = 80.</li>
+  <li>Cada servidor é dono do trecho que termina nele: A fica com (80, 10] (passando pelo zero), B com (10, 45], C com (45, 80].</li>
+</ul>
+<div class="table-wrap"><table>
+<tr><th>Chave</th><th>hash</th><th>Dono (próximo no sentido horário)</th><th>Depois de adicionar D em 60</th></tr>
+<tr><td>foto:1</td><td>5</td><td>A (10)</td><td>A</td></tr>
+<tr><td>foto:2</td><td>30</td><td>B (45)</td><td>B</td></tr>
+<tr><td>foto:3</td><td>52</td><td>C (80)</td><td><strong>D (60)</strong></td></tr>
+<tr><td>foto:4</td><td>70</td><td>C (80)</td><td>C</td></tr>
+<tr><td>foto:5</td><td>95</td><td>A (10, dando a volta)</td><td>A</td></tr>
+</table></div>
+<p>Ao adicionar D na posição 60, ele "rouba" de C o trecho (45, 60]. Só <code>foto:3</code> muda de dono, e ela vai obrigatoriamente para o servidor novo. As chaves de A e B nem ficam sabendo. Se depois C sair, o trecho dele, (60, 80], passa para o próximo no sentido horário, que é A.</p>
+<p>Esse último detalhe mostra um problema: quando C sai, <em>toda</em> a carga dele vai para um único vizinho (A), que de repente recebe o dobro. É o que os nós virtuais resolvem.</p>
 
 <h2 id="problemas">Dois problemas da abordagem básica</h2>
 <ol>
 <li><strong>Partições de tamanhos desiguais:</strong> com poucos servidores, o espaço entre eles no anel é aleatório. Um servidor pode ficar com 40% do anel e outro com 5%.</li>
 <li><strong>Distribuição desigual de chaves</strong>, e quando um servidor sai, toda a carga dele cai num único vizinho.</li>
 </ol>
+<figure class="ring-wrap" style="display:flex;flex-wrap:wrap;gap:12px;justify-content:center;margin:18px 0"><div style="text-align:center"><svg viewBox="0 0 300 300" width="300" height="300" role="img" aria-label="partições desiguais" style="max-width:100%"><circle cx="150.0" cy="150.0" r="108.0" fill="none" stroke="currentColor" stroke-opacity=".35" stroke-width="2"/><text x="150.0" y="146.0" text-anchor="middle" font-size="12" fill="currentColor" opacity=".7">sentido</text><text x="150.0" y="162.0" text-anchor="middle" font-size="12" fill="currentColor" opacity=".7">horário ↻</text><rect x="176.4" y="40.3" width="14" height="14" rx="3" fill="#2563eb"/><text x="189.6" y="32.3" text-anchor="middle" font-size="12" font-weight="700" fill="#2563eb">s0</text><rect x="216.9" y="64.3" width="14" height="14" rx="3" fill="#16a34a"/><text x="237.6" y="60.7" text-anchor="middle" font-size="12" font-weight="700" fill="#16a34a">s1</text><rect x="245.7" y="109.6" width="14" height="14" rx="3" fill="#d97706"/><text x="271.7" y="114.4" text-anchor="middle" font-size="12" font-weight="700" fill="#d97706">s2</text><rect x="245.7" y="176.4" width="14" height="14" rx="3" fill="#9333ea"/><text x="271.7" y="193.6" text-anchor="middle" font-size="12" font-weight="700" fill="#9333ea">s3</text></svg><div style="font-size:13px;color:var(--muted)">s0 fica com ~75% do anel</div></div><figcaption style="flex-basis:100%;text-align:center">Sem nós virtuais, as posições são aleatórias: aqui s0 é dono de todo o trecho de 30 a 5 (dando a volta), três quartos do anel.</figcaption></figure>
 <p>Nos testes: com 1 posição por servidor e 4 servidores, um ficou com <strong>86</strong> chaves e outro com <strong>39.191</strong> (de 40 mil).</p>
 
 <h2 id="virtuais">Nós virtuais (vnodes)</h2>
+<figure class="ring-wrap" style="display:flex;flex-wrap:wrap;gap:12px;justify-content:center;margin:18px 0"><div style="text-align:center"><svg viewBox="0 0 320 320" width="320" height="320" role="img" aria-label="nós virtuais" style="max-width:100%"><circle cx="160.0" cy="160.0" r="115.19999999999999" fill="none" stroke="currentColor" stroke-opacity=".35" stroke-width="2"/><text x="160.0" y="156.0" text-anchor="middle" font-size="12" fill="currentColor" opacity=".7">sentido</text><text x="160.0" y="172.0" text-anchor="middle" font-size="12" fill="currentColor" opacity=".7">horário ↻</text><circle cx="181.6" cy="46.8" r="5" fill="var(--bg,#fff)" stroke="#2563eb" stroke-width="2.5"/><text x="177.1" y="74.4" text-anchor="middle" font-size="11" fill="#2563eb">k0</text><circle cx="253.2" cy="92.3" r="5" fill="var(--bg,#fff)" stroke="#16a34a" stroke-width="2.5"/><text x="233.8" y="110.4" text-anchor="middle" font-size="11" fill="#16a34a">k1</text><circle cx="227.7" cy="253.2" r="5" fill="var(--bg,#fff)" stroke="#16a34a" stroke-width="2.5"/><text x="213.6" y="237.8" text-anchor="middle" font-size="11" fill="#16a34a">k2</text><circle cx="66.8" cy="227.7" r="5" fill="var(--bg,#fff)" stroke="#16a34a" stroke-width="2.5"/><text x="86.2" y="217.6" text-anchor="middle" font-size="11" fill="#16a34a">k3</text><circle cx="48.4" cy="131.4" r="5" fill="var(--bg,#fff)" stroke="#2563eb" stroke-width="2.5"/><text x="71.7" y="141.3" text-anchor="middle" font-size="11" fill="#2563eb">k4</text><rect x="208.5" y="52.0" width="14" height="14" rx="3" fill="#2563eb"/><text x="225.1" y="45.5" text-anchor="middle" font-size="12" font-weight="700" fill="#2563eb">s0#0</text><rect x="262.6" y="117.4" width="14" height="14" rx="3" fill="#16a34a"/><text x="288.6" y="122.2" text-anchor="middle" font-size="12" font-weight="700" fill="#16a34a">s1#0</text><rect x="254.0" y="208.5" width="14" height="14" rx="3" fill="#2563eb"/><text x="278.5" y="229.1" text-anchor="middle" font-size="12" font-weight="700" fill="#2563eb">s0#1</text><rect x="174.6" y="266.2" width="14" height="14" rx="3" fill="#16a34a"/><text x="185.3" y="296.8" text-anchor="middle" font-size="12" font-weight="700" fill="#16a34a">s1#1</text><rect x="85.3" y="246.2" width="14" height="14" rx="3" fill="#2563eb"/><text x="80.5" y="273.4" text-anchor="middle" font-size="12" font-weight="700" fill="#2563eb">s0#2</text><rect x="39.8" y="174.6" width="14" height="14" rx="3" fill="#16a34a"/><text x="27.2" y="189.3" text-anchor="middle" font-size="12" font-weight="700" fill="#16a34a">s1#2</text><rect x="55.7" y="91.3" width="14" height="14" rx="3" fill="#2563eb"/><text x="45.8" y="91.6" text-anchor="middle" font-size="12" font-weight="700" fill="#2563eb">s0#3</text><rect x="110.6" y="45.9" width="14" height="14" rx="3" fill="#16a34a"/><text x="110.2" y="38.3" text-anchor="middle" font-size="12" font-weight="700" fill="#16a34a">s1#3</text></svg><div style="font-size:13px;color:var(--muted)">2 servidores × 4 nós virtuais</div></div><figcaption style="flex-basis:100%;text-align:center">Com nós virtuais, cada servidor aparece em vários pontos do anel e fica com vários trechos pequenos, que somados dão uma fatia próxima da média.</figcaption></figure>
 <p>Cada servidor físico aparece <strong>várias vezes</strong> no anel (s0#0, s0#1, …, s0#199). Cada servidor fica com muitos trechos pequenos espalhados.</p>
 <ul>
 <li>A distribuição fica uniforme: o desvio padrão cai de forma marcante com 100–200 vnodes (5–10% de desvio). Nos testes, com 200 vnodes: entre 9.313 e 11.036 chaves por servidor.</li>
@@ -68,6 +110,19 @@
 <li><strong>Heterogeneidade:</strong> um servidor com o dobro de capacidade recebe o dobro de vnodes.</li>
 <li>Custo: mais memória para o índice (lista ordenada de posições) e um pouco mais de trabalho para rebalancear.</li>
 </ul>
+<h3>Por que mais vnodes equilibram melhor</h3>
+<p>É a mesma estatística de jogar uma moeda: com poucas jogadas, a proporção de caras varia muito; com muitas, converge para 50%. A fatia do anel de um servidor é a soma de V trechos aleatórios, e o desvio relativo dessa soma cai aproximadamente com <strong>1/√V</strong>. Com V = 1 o desvio é da ordem de 100% da média; com V = 100, ~10%; com V = 400, ~5%. Por isso os valores típicos ficam entre 100 e 256 vnodes por servidor: a partir daí, o ganho por vnode extra é pequeno e a memória do índice continua crescendo.</p>
+<p>Quanto custa o índice? 100 servidores × 200 vnodes = 20 mil posições de 4 bytes + o dono de cada uma: algumas centenas de KB. Cabe em qualquer cliente, e a busca binária em 20 mil itens leva ~15 comparações.</p>
+
+<h3>O que acontece de fato quando um nó entra</h3>
+<p>O anel diz <em>quem</em> deve ter cada chave, mas os dados não se movem sozinhos. Num <strong>cache</strong>, não é preciso mover nada: as chaves do trecho novo dão miss e são recarregadas do banco aos poucos. Num <strong>banco</strong> (Cassandra, DynamoDB), o nó novo passa por um <em>bootstrap</em>:</p>
+<ol>
+  <li>O nó entra no anel num estado "joining" e anuncia suas posições.</li>
+  <li>Os nós que eram donos dos trechos afetados fazem streaming desses dados para ele.</li>
+  <li>Durante a cópia, as escritas novas para esses trechos vão para os dois (o dono antigo e o novo), para que nada se perca.</li>
+  <li>Terminada a cópia, o nó passa a "normal" e o antigo dono apaga os dados que não são mais seus.</li>
+</ol>
+<p>Como é preciso saber a qualquer momento quem está no anel, os nós compartilham essa informação por <strong>gossip</strong> ou por um serviço de coordenação (ZooKeeper, etcd). Clientes "inteligentes" guardam uma cópia do anel e mandam a requisição direto ao nó certo; clientes simples mandam a qualquer nó, que encaminha.</p>
 
 <h2 id="codigo">Implementação em Go</h2>
 <p>O anel é uma lista ordenada de posições; a busca usa <strong>busca binária</strong> (O(log V), em que V = total de vnodes), com wrap-around no fim.</p>
@@ -218,6 +273,22 @@ ring_test.go: replicas=200  min=9313 max=11036</code></pre>
 <tr><td><strong>Jump consistent hash</strong> (Google)</td><td>Algoritmo de 5 linhas, sem memória, distribuição perfeita</td><td>Servidores numerados 0..N-1 que só crescem ou diminuem no fim (shards de storage)</td></tr>
 <tr><td><strong>Partições fixas</strong> (shards lógicos)</td><td>Cria, por exemplo, 4096 partições desde o início e mapeia partição → nó numa tabela</td><td>Kafka, Elasticsearch, Redis Cluster (16384 slots), Riak. Rebalancear = mover partições inteiras</td></tr>
 </table></div>
+<h3>Jump consistent hash, em 6 linhas</h3>
+<p>Vale conhecer pelo contraste: não tem anel nem memória. Dado o hash de 64 bits da chave e o número de buckets, devolve um bucket entre 0 e N−1, com distribuição praticamente perfeita e movimento mínimo quando N cresce:</p>
+<pre><code class="language-go">func JumpHash(key uint64, buckets int32) int32 {
+	var b, j int64 = -1, 0
+	for j &lt; int64(buckets) {
+		b = j
+		key = key*2862933555777941757 + 1
+		j = int64(float64(b+1) * (float64(int64(1)&lt;&lt;31) / float64((key&gt;&gt;33)+1)))
+	}
+	return int32(b)
+}</code></pre>
+<p>A limitação: os buckets são numerados e só se pode adicionar ou remover <em>no fim</em>. Ele não sabe tirar o servidor 7 de um cluster de 20. Serve bem para shards de armazenamento (que crescem de forma planejada), mal para caches onde qualquer nó pode morrer.</p>
+
+<h3>Consistent hashing com carga limitada</h3>
+<p>Mesmo com vnodes, se algumas chaves forem muito mais populares que outras, um servidor pode receber mais tráfego que os demais. A variante <em>bounded loads</em> (publicada pelo Google e usada no HAProxy e no Vimeo) define uma capacidade máxima por servidor, por exemplo 1,25× a média: se o dono natural de uma chave já está cheio, a requisição segue no sentido horário até um servidor com folga. Isso mantém quase toda a afinidade e limita a sobrecarga.</p>
+
 <div class="box interview"><strong class="t">Frase para a entrevista</strong>
 "Para distribuir as chaves entre os nós de cache vou usar consistent hashing com ~150 nós virtuais por servidor. Assim, adicionar um nó move ~1/N das chaves e a carga fica equilibrada. Alternativamente, partições fixas, como os 16384 slots do Redis Cluster, dão o mesmo efeito com um mapa explícito."</div>
 
@@ -246,8 +317,8 @@ ring_test.go: replicas=200  min=9313 max=11036</code></pre>
 
 <h2 id="recursos">Vídeos e leituras</h2>
 <ul class="links">
-<li class="video"><a href="https://www.youtube.com/results?search_query=bytebytego+consistent+hashing" target="_blank" rel="noopener">ByteByteGo: Consistent hashing</a></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=gaurav+sen+consistent+hashing" target="_blank" rel="noopener">Gaurav Sen: Consistent hashing</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=UF9Iqmg94tk" target="_blank" rel="noopener">ByteByteGo: Consistent hashing</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=zaRkONvyGr8" target="_blank" rel="noopener">Gaurav Sen: Consistent hashing</a></li>
 <li class="read"><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf" target="_blank" rel="noopener">Paper do Dynamo (seção 4.2: particionamento)</a></li>
 <li class="read"><a href="https://arxiv.org/abs/1406.2294" target="_blank" rel="noopener">A Fast, Minimal Memory, Consistent Hash Algorithm (Jump hash)</a></li>
 <li class="read"><a href="https://research.google/pubs/maglev-a-fast-and-reliable-software-network-load-balancer/" target="_blank" rel="noopener">Google Maglev</a></li>

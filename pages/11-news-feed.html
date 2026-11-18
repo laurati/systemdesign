@@ -22,6 +22,19 @@
 <li>Organizar o cache em camadas e implementar o fanout híbrido em Go.</li>
 </ul></div>
 
+<h2 id="conceitos">Conceitos deste capítulo</h2>
+<div class="table-wrap"><table>
+<tr><th>Conceito</th><th>Definição</th></tr>
+<tr><td>News feed</td><td>Lista, atualizada continuamente, dos posts das pessoas e páginas que o usuário segue.</td></tr>
+<tr><td>Fanout</td><td>Distribuir um post para todos os seguidores do autor.</td></tr>
+<tr><td>Fanout on write (push)</td><td>Fazer o fanout no momento da publicação, gravando o post no feed pré-computado de cada seguidor.</td></tr>
+<tr><td>Fanout on read (pull)</td><td>Montar o feed só quando o usuário o abre, buscando os posts recentes de quem ele segue.</td></tr>
+<tr><td>Problema da celebridade</td><td>Contas com milhões de seguidores tornam o push caro e lento demais.</td></tr>
+<tr><td>Grafo social</td><td>As relações de quem segue quem, normalmente guardadas como arestas (seguidor, seguido).</td></tr>
+<tr><td>Hidratação</td><td>Transformar uma lista de IDs em objetos completos (texto, autor, foto, contadores) para exibir.</td></tr>
+<tr><td>Paginação por cursor</td><td>Pedir a próxima página a partir do último item visto, em vez de um número de página.</td></tr>
+</table></div>
+
 <h2 id="requisitos">Requisitos</h2>
 <div class="dialog">
 <p class="c">Mobile, web ou os dois?</p><p class="i">Os dois.</p>
@@ -31,6 +44,16 @@
 <p class="c">Tráfego?</p><p class="i">10 milhões de DAU.</p>
 <p class="c">Mídia?</p><p class="i">Imagens e vídeos.</p>
 </div>
+
+<h2 id="estimativas">Estimativas</h2>
+<p>Premissas: 10 M DAU; cada usuário publica 1 post a cada 5 dias (2 M posts/dia); abre o feed 10 vezes por dia; média de 200 seguidores.</p>
+<ul>
+  <li><strong>Publicações:</strong> 2 M / 10<sup>5</sup> ≈ 20/s (pico ~60/s). Baixo.</li>
+  <li><strong>Leituras de feed:</strong> 10 M × 10 / 10<sup>5</sup> = 1.000/s (pico ~3.000/s). Cada leitura traz 20 posts.</li>
+  <li><strong>Escritas de fanout (push):</strong> 2 M posts × 200 seguidores = 400 M inserções por dia ≈ <strong>4.000/s</strong>. A operação "barata" de publicar se multiplica por 200 no backend.</li>
+  <li><strong>Memória do feed cache:</strong> 10 M usuários × 500 post_ids × 8 bytes = 40 GB brutos; com overhead das estruturas do Redis, ~100 GB. Alguns nós.</li>
+</ul>
+<p><strong>O que isso implica:</strong> a leitura é 50× mais frequente que a publicação e precisa ser rápida, o que favorece pré-computar (push). Mas o custo do push é proporcional ao número de seguidores, e esse número tem uma distribuição muito desigual: a média é 200, mas algumas contas têm dezenas de milhões. É daí que vem o problema central do capítulo.</p>
 
 <h2 id="api">APIs</h2>
 <pre><code class="language-http">POST /v1/me/feed     { content, media_ids[], auth_token }      → publica
@@ -164,6 +187,27 @@ func (s *Service) Feed(user string, limit int) []Post {
 	return out
 }</code></pre>
 
+<h3>Onde colocar o limiar de celebridade</h3>
+<p>Pense no custo de cada lado. Um autor com F seguidores custa F escritas por post no modelo push. No modelo pull, cada seguidor que abre o feed faz uma leitura extra dos posts recentes desse autor. Se o autor tem 50 milhões de seguidores e posta 5 vezes por dia, o push custa 250 milhões de escritas por dia <em>só para ele</em>, e cada post leva minutos para chegar a todos. Com pull, o custo é uma leitura (muito cacheável, porque é o mesmo dado para todos) por abertura de feed.</p>
+<p>Limiares típicos ficam entre 10 mil e 1 milhão de seguidores. O valor exato importa menos que três ideias: (1) o limiar é configurável; (2) o pull de celebridades é barato porque "posts recentes da celebridade X" é uma única chave de cache lida por todos; (3) cada usuário segue poucas celebridades (dezenas), então o merge na leitura continua pequeno.</p>
+
+<h3>Montando o feed híbrido na leitura</h3>
+<ol>
+  <li>Lê o feed pré-computado do usuário: uma lista de post_ids ordenada (vindo do push).</li>
+  <li>Lê a lista de celebridades que ele segue (poucas) e, para cada uma, os post_ids recentes (do cache "posts por autor").</li>
+  <li>Faz o <strong>merge</strong> das listas, que já estão ordenadas por post_id (e o post_id é ordenado por tempo, por ser um Snowflake): é um k-way merge com um heap, pegando os 20 maiores IDs menores que o cursor.</li>
+  <li>Hidrata os 20 IDs (conteúdo, autor, contadores) com <code>MGET</code> nos caches.</li>
+  <li>Filtra o que não deve aparecer (post apagado, autor bloqueado depois do fanout) e devolve, com <code>next_cursor</code> = menor post_id da página.</li>
+</ol>
+<p>Como o cursor é um post_id e todas as fontes são ordenadas pelo mesmo ID, a paginação funciona igual para posts vindos do push e do pull.</p>
+
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart LR
+  P[Post publicado: post_id 987, autor 42] --> FS[Fanout service]
+  FS -->|"1. quem segue o autor 42?"| G[(Grafo social)]
+  FS -->|"2. remove quem silenciou ou bloqueou"| UC[(Configurações de usuários)]
+  FS -->|"3. lotes de seguidores"| Q[[Fila]]
+  Q --> W[Fanout workers]
+  W -->|"4. LPUSH 987 no feed de cada seguidor"| NC[("Feed cache: user_id → [987, 951, 940…]")]</pre></figure>
 <h3>Como o fanout service trabalha</h3>
 <ol>
 <li>Busca os IDs dos seguidores no graph DB (ou numa tabela <code>follows</code> com índice).</li>
@@ -195,12 +239,43 @@ func (s *Service) Feed(user string, limit int) []Post {
 <tr><td>Contadores</td><td>Curtidas, respostas, seguidores (contadores em Redis, persistidos em lote)</td></tr>
 </table></div>
 
+<figure class="mermaid-wrap"><pre class="mermaid">flowchart TB
+  subgraph Cache
+    L1["News feed: IDs do feed de cada usuário"]
+    L2["Conteúdo: posts populares (quente) e demais (normal)"]
+    L3["Grafo social: seguidores e seguidos"]
+    L4["Ações: curtiu, respondeu, compartilhou"]
+    L5["Contadores: curtidas, respostas, seguidores"]
+  end
+  FS[News feed service] --> L1 & L2 & L3 & L4 & L5</pre>
+<figcaption>Cinco camadas de cache, cada uma com padrão de acesso e política de expiração próprios.</figcaption></figure>
 <h2 id="dados">Modelo de dados e armazenamento</h2>
 <ul>
 <li><strong>Posts:</strong> post_id (Snowflake, ordenável por tempo), author_id, content, media_urls, created_at. Volume alto, acesso por id e por autor: Cassandra/DynamoDB, ou MySQL sharded por author_id.</li>
 <li><strong>Follows:</strong> <code>(follower_id, followee_id)</code> com índices nas duas direções, num relacional sharded ou num graph store (TAO no Facebook).</li>
 <li><strong>Mídia:</strong> S3 + CDN.</li>
 </ul>
+
+<h2 id="casos">Casos que quebram o feed (e como tratar)</h2>
+<div class="table-wrap"><table>
+<tr><th>Situação</th><th>Problema</th><th>Tratamento</th></tr>
+<tr><td>Usuário começa a seguir alguém</td><td>O feed pré-computado não tem os posts antigos dessa pessoa</td><td>Backfill assíncrono: inserir os últimos N posts dela no feed do novo seguidor (ou aceitar que só os novos apareçam)</td></tr>
+<tr><td>Usuário deixa de seguir</td><td>Os posts já estão no feed dele</td><td>Filtrar na leitura (checar se ainda segue o autor) e limpar em segundo plano</td></tr>
+<tr><td>Post apagado</td><td>O ID está em milhares de feeds</td><td>Não limpar cada feed: marcar o post como apagado e filtrar na hidratação</td></tr>
+<tr><td>Usuário volta após 6 meses</td><td>Feed expirou do cache (ou nunca foi computado, se o fanout pula inativos)</td><td>Reconstruir sob demanda com pull na primeira abertura e repopular o cache</td></tr>
+<tr><td>Autor cruza o limiar de celebridade</td><td>Seguidores antigos têm posts dele no feed via push; novos posts virão por pull</td><td>Funciona sem migração: o merge na leitura junta as duas fontes; só é preciso deduplicar IDs</td></tr>
+<tr><td>Fila de fanout atrasada</td><td>Posts demoram a aparecer</td><td>Monitorar a idade da mensagem mais antiga; escalar workers; priorizar fanout para usuários ativos agora</td></tr>
+</table></div>
+
+<h2 id="ranking">Como funciona um feed ranqueado</h2>
+<p>Se o entrevistador mudar o requisito para "ordenado por relevância", a arquitetura de armazenamento quase não muda; o que entra é um pipeline na leitura:</p>
+<ol>
+  <li><strong>Geração de candidatos:</strong> os ~500 a 1.000 posts recentes vindos do push e do pull (exatamente o que já temos).</li>
+  <li><strong>Features:</strong> para cada candidato, dados como afinidade do leitor com o autor (interações recentes), tipo de mídia, idade do post, engajamento até agora. Ficam num feature store de baixa latência.</li>
+  <li><strong>Pontuação:</strong> um modelo de ML estima a probabilidade de curtir, comentar ou passar mais tempo, e combina numa nota.</li>
+  <li><strong>Regras finais:</strong> diversidade (não mostrar 5 posts seguidos do mesmo autor), remoção do que já foi visto, conteúdo patrocinado.</li>
+</ol>
+<p>A paginação muda: com ranking, "o próximo" não é mais "o de ID menor". O comum é ranquear um lote, guardar o resultado numa sessão de feed com TTL curto e paginar sobre ele.</p>
 
 <h2 id="extras">Para o fechamento</h2>
 <ul>
@@ -238,8 +313,8 @@ func (s *Service) Feed(user string, limit int) []Post {
 <li class="read"><a href="https://www.hellointerview.com/learn/system-design/problem-breakdowns/fb-news-feed" target="_blank" rel="noopener">Hello Interview: Facebook News Feed</a></li>
 <li class="read"><a href="https://www.usenix.org/system/files/conference/atc13/atc13-bronson.pdf" target="_blank" rel="noopener">TAO: Facebook's Distributed Data Store for the Social Graph</a></li>
 <li class="read"><a href="https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf" target="_blank" rel="noopener">Scaling Memcache at Facebook</a></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=twitter+timeline+architecture+raffi+krikorian" target="_blank" rel="noopener">Timelines at Scale (Raffi Krikorian, Twitter)</a><small>A palestra clássica sobre fanout no Twitter.</small></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=bytebytego+news+feed+system+design" target="_blank" rel="noopener">ByteByteGo: News feed</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=J5auCY4ajK8" target="_blank" rel="noopener">Real-Time Delivery Architecture at Twitter (Raffi Krikorian)</a><small>A palestra clássica sobre fanout de timelines no Twitter (QCon 2012).</small></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=Qj4-GruzyDU" target="_blank" rel="noopener">Hello Interview: Design FB News Feed</a></li>
 </ul>
 
 </article>

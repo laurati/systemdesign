@@ -22,6 +22,53 @@
 <li>Usar números para justificar (ou descartar) decisões de arquitetura.</li>
 </ul></div>
 
+<h2 id="conceitos">Conceitos deste capítulo</h2>
+<div class="table-wrap"><table>
+<tr><th>Conceito</th><th>Definição</th></tr>
+<tr><td>Back-of-the-envelope</td><td>Estimativa rápida, com números redondos, para verificar se um design é viável.</td></tr>
+<tr><td>QPS</td><td>Consultas (requisições) por segundo.</td></tr>
+<tr><td>Pico</td><td>A taxa máxima esperada, normalmente 2 a 3 vezes a média.</td></tr>
+<tr><td>DAU / MAU</td><td>Usuários ativos por dia / por mês.</td></tr>
+<tr><td>Latência</td><td>Tempo entre pedir algo e receber a resposta.</td></tr>
+<tr><td>Disponibilidade</td><td>Fração do tempo em que o sistema funciona, expressa em "noves" (99,9%).</td></tr>
+<tr><td>SLA / SLO / SLI</td><td>Contrato com o cliente / meta interna / métrica medida.</td></tr>
+</table></div>
+
+<h2 id="por-que">Por que estimar, e o que fazer com o resultado</h2>
+<p>Estimativa não é prova de matemática. Ela existe para responder perguntas de arquitetura que, sem números, viram opinião: "precisa de cache?", "cabe num banco só?", "quantas máquinas?". Um bom número muda uma decisão. A tabela abaixo mostra as faixas que costumam virar decisões:</p>
+<div class="table-wrap"><table>
+<tr><th>Se a estimativa der…</th><th>Então provavelmente…</th></tr>
+<tr><td>Escritas &lt; ~1–5 mil/s</td><td>Um primário relacional dá conta; sem sharding.</td></tr>
+<tr><td>Escritas de dezenas a centenas de milhares/s</td><td>Banco particionado (Cassandra, DynamoDB) ou sharding; talvez fila na frente para absorver picos.</td></tr>
+<tr><td>Leituras muito maiores que escritas (10:1 ou mais)</td><td>Réplicas de leitura + cache.</td></tr>
+<tr><td>Dados &lt; ~1–2 TB</td><td>Cabe num banco só (com réplicas).</td></tr>
+<tr><td>Dados de dezenas de TB ou mais</td><td>Particionar; blobs vão para object storage.</td></tr>
+<tr><td>Conjunto "quente" &lt; algumas centenas de GB</td><td>Cabe inteiro num cluster de cache.</td></tr>
+<tr><td>Banda de saída de Gbps a Tbps</td><td>CDN obrigatória.</td></tr>
+<tr><td>Milhões de conexões simultâneas</td><td>Camada dedicada de conexões (gateways WebSocket), dimensionada por conexões, não por QPS.</td></tr>
+</table></div>
+
+<h2 id="metodo">O método em 5 passos</h2>
+<ol>
+  <li><strong>Escreva as premissas.</strong> Usuários (MAU → DAU), ações por usuário por dia, tamanho de cada item, retenção, proporção leitura:escrita. Se o entrevistador não deu, proponha números redondos e pergunte se fazem sentido.</li>
+  <li><strong>Calcule o tráfego.</strong> QPS médio de escrita e de leitura; depois o pico.</li>
+  <li><strong>Calcule o armazenamento.</strong> Por dia, depois pela retenção total, depois com replicação.</li>
+  <li><strong>Calcule banda e memória</strong>, se forem relevantes (mídia, cache).</li>
+  <li><strong>Tire conclusões.</strong> Uma ou duas frases sobre o que os números implicam para o design.</li>
+</ol>
+
+<h2 id="tabela-conversao">Tabela de conversão rápida</h2>
+<p>Decorar estes pares economiza muito tempo. Um dia tem ~10<sup>5</sup> segundos, então:</p>
+<div class="table-wrap"><table>
+<tr><th>Por dia</th><th>Por segundo (médio)</th></tr>
+<tr><td>1 milhão</td><td>~12 (arredonde para 10)</td></tr>
+<tr><td>10 milhões</td><td>~120 (≈ 100)</td></tr>
+<tr><td>100 milhões</td><td>~1.200 (≈ 1 mil)</td></tr>
+<tr><td>1 bilhão</td><td>~12.000 (≈ 10 mil)</td></tr>
+<tr><td>10 bilhões</td><td>~120.000 (≈ 100 mil)</td></tr>
+</table></div>
+<p>E para tamanhos: 1 milhão × 1 KB = 1 GB; 1 bilhão × 1 KB = 1 TB; 1 bilhão × 1 MB = 1 PB. Com isso, quase toda conta vira "mova a vírgula".</p>
+
 <h2 id="potencias">Potências de 2</h2>
 <div class="table-wrap"><table>
 <tr><th>Potência</th><th>Valor aproximado</th><th>Nome</th><th>Abrev.</th></tr>
@@ -84,6 +131,22 @@
 </table></div>
 <p>Referências de capacidade (ordens de grandeza): um PostgreSQL bem configurado faz alguns milhares a ~10–20 mil escritas simples/s; um Redis faz ~100 mil ops/s por nó; uma partição Kafka faz ~10 MB/s; uma conexão WebSocket ociosa custa alguns KB, então um servidor aguenta ~100 mil a 1 milhão de conexões.</p>
 
+<h3>De onde vem o fator de pico</h3>
+<p>O tráfego não é uniforme: concentra-se nas horas acordadas e, num produto de um único país, num intervalo de ~12 horas. Só isso já dobra a taxa média nessas horas. Por isso 2–3× é o padrão. Use fatores maiores quando houver um gatilho que sincroniza usuários: final de jogo, Black Friday, abertura de venda de ingressos (aí pode ser 10× a 100×). Diga qual fator está usando e por quê.</p>
+
+<h3>Lei de Little: quantas requisições ao mesmo tempo?</h3>
+<p>Uma fórmula simples que resolve muitas perguntas de dimensionamento:</p>
+<p style="text-align:center"><strong>concorrência = vazão × latência</strong></p>
+<p>Se um serviço recebe 2.000 req/s e cada uma leva 50 ms, há em média 2.000 × 0,05 = <strong>100 requisições em andamento</strong> a qualquer instante. Usos:</p>
+<ul>
+  <li><strong>Pool de conexões do banco:</strong> 5.000 queries/s de 4 ms cada → 20 conexões ocupadas em média. Um pool de 50 dá folga; um de 5 vira gargalo.</li>
+  <li><strong>Threads/workers:</strong> se cada requisição prende uma thread por 200 ms (chamada a uma API externa) e chegam 1.000 req/s, você precisa de 200 threads ocupadas. Por isso dependências lentas derrubam serviços: a latência sobe, a concorrência sobe junto e o pool esgota.</li>
+  <li><strong>Conexões persistentes:</strong> para WebSockets a conta é direta: concorrência = usuários online.</li>
+</ul>
+
+<h3>Quantos servidores?</h3>
+<p>Divida o QPS de pico pela capacidade de um servidor e acrescente folga: <strong>servidores = pico ÷ capacidade ÷ 0,6–0,7</strong>, porque ninguém roda máquinas a 100% (a latência explode perto da saturação) e você precisa tolerar a perda de uma zona inteira. Exemplo: 30.000 req/s de pico, 2.000 req/s por servidor → 15 servidores a 100%; com alvo de 60%, ~25; espalhados em 3 zonas para sobreviver à queda de uma, ~38 (as 2 zonas restantes precisam aguentar tudo, então cada zona precisa de metade da capacidade total: 25 × 1,5).</p>
+
 <h2 id="exemplo-twitter">Exemplo resolvido: QPS e armazenamento de um "Twitter"</h2>
 <p><strong>Premissas</strong> (diga-as em voz alta e escreva):</p>
 <ul>
@@ -101,6 +164,51 @@ O número só vale se mudar uma decisão. "São 55 PB de mídia, então ela vai 
 <h2 id="exemplo-leitura">Exemplo resolvido: leitura e cache</h2>
 <p>Se cada usuário lê o timeline 10 vezes por dia e cada timeline traz 20 tweets: 150 M × 10 / 10<sup>5</sup> = <strong>15.000 leituras de timeline/s</strong> (pico ~30 mil), e cada uma busca 20 tweets, ou seja, 300 mil leituras de tweet/s. Isso pede cache e timelines pré-computados (veja <a href="11-news-feed.html">News feed</a>).</p>
 <p>Cache para tweets "quentes" dos últimos 2 dias: 600 M tweets × 250 B = 150 GB. Cabe em poucos nós de Redis.</p>
+
+<h2 id="exemplo-video">Exemplo resolvido: banda de um serviço de vídeo</h2>
+<p><strong>Premissas:</strong> 5 M DAU, cada um assiste 30 min por dia, bitrate médio de 3 Mbps (720p–1080p).</p>
+<ul>
+  <li>Tempo assistido por dia: 5 M × 30 min = 150 M minutos = 9 × 10<sup>9</sup> segundos.</li>
+  <li>Espectadores simultâneos em média: 9 × 10<sup>9</sup> s ÷ 86.400 s ≈ <strong>100 mil</strong> (Lei de Little de novo: taxa × duração). No horário nobre, ~3× = 300 mil.</li>
+  <li>Banda de pico: 300 mil × 3 Mbps = 900 Gbps ≈ <strong>~1 Tbps</strong>.</li>
+</ul>
+<p><strong>Conclusão:</strong> nenhum datacenter próprio serve 1 Tbps de forma econômica para usuários espalhados: a CDN é obrigatória, e o custo dominante do sistema é a transferência de dados, não os servidores. Isso justifica investir em codecs mais eficientes (cada 20% de compressão a mais é 20% a menos na conta).</p>
+<div class="box warn"><strong class="t">Bits × bytes</strong>
+Banda de rede é medida em <strong>bits</strong> por segundo (Mbps, Gbps); armazenamento, em <strong>bytes</strong>. 1 byte = 8 bits. Um vídeo de 3 Mbps consome 3/8 ≈ 0,375 MB por segundo, ou ~1,35 GB por hora. Confundir os dois erra a conta por 8×.</div>
+
+<h2 id="exemplo-chat">Exemplo resolvido: servidores de chat</h2>
+<p><strong>Premissas:</strong> 50 M DAU, 20% online no pico, cada usuário online mantém 1 WebSocket; cada usuário envia 40 mensagens por dia de ~100 bytes.</p>
+<ul>
+  <li>Conexões simultâneas no pico: 50 M × 20% = <strong>10 M</strong>. Com ~100 mil conexões por servidor (limite prático de memória e de CPU para heartbeats), são <strong>~100 servidores de conexão</strong>, mais folga.</li>
+  <li>Mensagens: 50 M × 40 / 10<sup>5</sup> = <strong>20 mil msgs/s</strong> em média, ~60 mil/s no pico.</li>
+  <li>Armazenamento: 2 bilhões de mensagens/dia × 100 B = 200 GB/dia; com metadados e índices (~2×) e 3 réplicas, ~1,2 TB/dia, ou <strong>~440 TB/ano</strong>.</li>
+</ul>
+<p><strong>Conclusão:</strong> o gargalo da camada de entrada é o número de conexões, não o QPS; o armazenamento cresce rápido e pede um banco de escrita intensa particionado por conversa (veja <a href="12-chat.html">Chat</a>).</p>
+
+<h2 id="exemplo-memoria">Exemplo resolvido: cabe na memória?</h2>
+<p>"Quero guardar, para cada usuário, se ele está online." 1 bilhão de usuários × (chave de 8 bytes + valor de 1 byte) ≈ 9 GB brutos. Com o overhead real de uma estrutura de dados (um hash map comum gasta 3–10× o tamanho bruto), 30–90 GB. Cabe num punhado de nós de Redis. Se fosse só o bit: um <em>bitmap</em> de 1 bilhão de bits ocupa 125 MB.</p>
+<p>A lição: estimativas de memória precisam de um fator de overhead para ponteiros, índices e metadados, e muitas vezes a estrutura de dados certa muda a resposta em ordens de grandeza.</p>
+
+<h2 id="erros">Erros comuns em estimativas</h2>
+<ul>
+  <li><strong>Esquecer a replicação</strong> (normalmente 3×) e os índices (podem dobrar o tamanho de uma tabela).</li>
+  <li><strong>Confundir bits e bytes</strong> em banda.</li>
+  <li><strong>Usar média quando o pico é o que dimensiona.</strong></li>
+  <li><strong>Precisão falsa:</strong> "3.472,2 QPS" passa a impressão errada. Diga "~3,5 mil".</li>
+  <li><strong>Calcular sem concluir:</strong> o número deve virar uma decisão.</li>
+  <li><strong>Gastar 15 minutos em contas</strong> e não ter tempo para o design.</li>
+</ul>
+
+<h2 id="pratica">Pratique</h2>
+<p>Tente cada uma antes de abrir a resposta.</p>
+<details><summary>1. Um serviço de fotos recebe 2 M uploads por dia, 500 KB cada, com 3 tamanhos de miniatura (somando 100 KB). Quanto armazenamento em 10 anos, com 3 réplicas?</summary><div class="body">
+<p>Por dia: 2 M × 600 KB = 1,2 TB. Por ano: ~440 TB. Em 10 anos: ~4,4 PB. Com 3 réplicas: <strong>~13 PB</strong>. Conclusão: object storage (que já replica por conta própria, muitas vezes com erasure coding, cujo overhead é ~1,5× em vez de 3×) e ciclo de vida para mover fotos antigas a uma classe de armazenamento mais barata.</p></div></details>
+<details><summary>2. Uma API recebe 50 mil req/s de pico; cada uma faz 1 query de 10 ms no banco. Quantas conexões de banco ficam ocupadas?</summary><div class="body">
+<p>Lei de Little: 50.000 × 0,01 s = <strong>500 conexões</strong> em uso simultâneo. Um Postgres sofre com milhares de conexões (cada uma é um processo), então você usaria um pooler (PgBouncer) e/ou réplicas para dividir a carga.</p></div></details>
+<details><summary>3. Um contador de visualizações recebe 1 bilhão de eventos por dia. Escrever cada um direto no banco é viável?</summary><div class="body">
+<p>1 bilhão/dia ≈ 12 mil/s em média, ~30–40 mil/s no pico, quase tudo concentrado nos vídeos populares (a mesma linha atualizada milhares de vezes por segundo, gerando contenção de lock). A solução é agregar: contar em memória ou no Redis (<code>INCR</code>) e gravar no banco em lote a cada poucos segundos, ou mandar os eventos para um stream e agregar por janela de tempo.</p></div></details>
+<details><summary>4. 200 M de usuários, cada um com 500 seguidores em média, postam 1 vez por dia. Quantas escritas por segundo o fanout na escrita exigiria?</summary><div class="body">
+<p>200 M posts/dia × 500 = 10<sup>11</sup> inserções em timelines por dia ≈ <strong>1 milhão por segundo</strong> em média. É viável num cache distribuído grande, mas mostra por que celebridades (com milhões de seguidores) precisam de tratamento especial. Veja <a href="11-news-feed.html">News feed</a>.</p></div></details>
 
 <h2 id="calculadora">Calculadora rápida</h2>
 <div class="card" id="calc">
@@ -163,7 +271,7 @@ O número só vale se mudar uma decisão. "São 55 PB de mídia, então ela vai 
 <ul class="links">
 <li class="read"><a href="https://gist.github.com/jboner/2841832" target="_blank" rel="noopener">Latency Numbers Every Programmer Should Know (gist)</a></li>
 <li class="read"><a href="https://colin-scott.github.io/personal_website/research/interactive_latency.html" target="_blank" rel="noopener">Latências interativas por ano</a><small>Mostra como os números evoluíram.</small></li>
-<li class="video"><a href="https://www.youtube.com/results?search_query=back+of+the+envelope+estimation+system+design+interview" target="_blank" rel="noopener">Vídeos: back-of-the-envelope estimation</a></li>
+<li class="video"><a href="https://www.youtube.com/watch?v=UC5xf8FbdJc" target="_blank" rel="noopener">ByteByteGo: Back-of-the-envelope estimation / capacity planning</a></li>
 <li class="read"><a href="https://sre.google/sre-book/availability-table/" target="_blank" rel="noopener">Google SRE Book: tabela de disponibilidade</a></li>
 <li class="read"><a href="https://www.hellointerview.com/learn/system-design/in-a-hurry/introduction" target="_blank" rel="noopener">Hello Interview: System Design in a Hurry</a><small>Inclui uma boa seção sobre quando estimar.</small></li>
 </ul>
