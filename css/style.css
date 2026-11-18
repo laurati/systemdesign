@@ -264,6 +264,9 @@ ul.links li small { color: var(--muted); display: block; }
   .hero { padding: 24px 20px; }
   .dialog p { padding-left: 0; padding-top: 22px; }
   pre { font-size: 13px; }
+  .mermaid-wrap { text-align: left; }
+  .mermaid-wrap svg { min-width: min(var(--natural, 100%), 720px); }
+  .mermaid-wrap figcaption::after { content: " (arraste para o lado para ver o diagrama inteiro)"; }
 }
 @media print {
   .topbar, .sidebar, .pager, .mark-done, .copy-btn { display: none !important; }

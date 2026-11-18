@@ -32,6 +32,7 @@ const SITE_PAGES = [
 ];
 
 const STORE_KEY = "sdprep:done";
+let mermaidMod = null; // declarado antes do init(), que roda imediatamente
 const store = {
   get(k, def) { try { return JSON.parse(localStorage.getItem(k)) ?? def; } catch { return def; } },
   set(k, v) { localStorage.setItem(k, JSON.stringify(v)); },
@@ -218,7 +219,6 @@ function loadHighlight() {
 }
 
 // ---------------- Mermaid (CDN) ----------------
-let mermaidMod = null;
 async function renderMermaid(rerender, scope = document) {
   const nodes = [...scope.querySelectorAll("pre.mermaid")];
   if (!nodes.length) return;
@@ -231,6 +231,8 @@ async function renderMermaid(rerender, scope = document) {
     const dark = document.documentElement.dataset.theme === "dark";
     mermaidMod.initialize({ startOnLoad: false, theme: dark ? "dark" : "default", securityLevel: "loose", flowchart: { useMaxWidth: true, htmlLabels: true } });
     await mermaidMod.run({ nodes: nodes.filter((n) => !n.dataset.processed) });
+    // guarda a largura natural para o CSS mobile manter diagramas largos legíveis (com rolagem)
+    nodes.forEach((n) => { const svg = n.querySelector("svg"); if (svg && svg.style.maxWidth) svg.style.setProperty("--natural", svg.style.maxWidth); });
   } catch (e) {
     console.warn("Mermaid indisponível (offline?) — mostrando o código do diagrama.", e);
   }
